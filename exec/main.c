@@ -193,25 +193,29 @@ void corosync_state_dump (void)
 static void corosync_blackbox_write_to_file (void)
 {
 	char fname[PATH_MAX];
+	char fdata_fname[PATH_MAX];
 	char time_str[PATH_MAX];
 	struct tm cur_time_tm;
 	time_t cur_time_t;
+	ssize_t res;
 
 	cur_time_t = time(NULL);
 	localtime_r(&cur_time_t, &cur_time_tm);
 
 	strftime(time_str, PATH_MAX, "%Y-%m-%dT%H:%M:%S", &cur_time_tm);
 	snprintf(fname, PATH_MAX, "%s/fdata-%s-%lld",
-	    LOCALSTATEDIR "/lib/corosync",
+	    get_run_dir(),
 	    time_str,
 	    (long long int)getpid());
 
-	qb_log_blackbox_write_to_file(fname);
-
-	unlink(LOCALSTATEDIR "/lib/corosync/fdata");
-	if (symlink(fname, LOCALSTATEDIR "/lib/corosync/fdata") == -1) {
+	if ((res = qb_log_blackbox_write_to_file(fname)) < 0) {
+		LOGSYS_PERROR(-res, LOGSYS_LEVEL_ERROR, "Can't store blackbox file");
+	}
+	snprintf(fdata_fname, sizeof(fdata_fname), "%s/fdata", get_run_dir());
+	unlink(fdata_fname);
+	if (symlink(fname, fdata_fname) == -1) {
 		log_printf(LOGSYS_LEVEL_ERROR, "Can't create symlink to '%s' for corosync blackbox file '%s'",
-		    fname, LOCALSTATEDIR "/lib/corosync/fdata");
+		    fname, fdata_fname);
 	}
 }
 
@@ -699,6 +703,87 @@ int main_mcast (
 	return (totempg_groups_mcast_joined (corosync_group_handle, iovec, iov_len, guarantee));
 }
 
+static void corosync_ring_id_create_or_load (
+	struct memb_ring_id *memb_ring_id,
+	const struct totem_ip_address *addr)
+{
+	int fd;
+	int res = 0;
+	char filename[PATH_MAX];
+
+	snprintf (filename, sizeof(filename), "%s/ringid_%s",
+		get_run_dir(), totemip_print (addr));
+	fd = open (filename, O_RDONLY, 0700);
+	/*
+	 * If file can be opened and read, read the ring id
+	 */
+	if (fd != -1) {
+		res = read (fd, &memb_ring_id->seq, sizeof (uint64_t));
+		close (fd);
+	}
+	/*
+	 * If file could not be opened or read, create a new ring id
+	 */
+	if ((fd == -1) || (res != sizeof (uint64_t))) {
+		memb_ring_id->seq = 0;
+		umask(0);
+		fd = open (filename, O_CREAT|O_RDWR, 0700);
+		if (fd != -1) {
+			res = write (fd, &memb_ring_id->seq, sizeof (uint64_t));
+			close (fd);
+			if (res == -1) {
+				LOGSYS_PERROR (errno, LOGSYS_LEVEL_ERROR,
+					"Couldn't write ringid file '%s'", filename);
+
+				corosync_exit_error (COROSYNC_DONE_STORE_RINGID);
+			}
+		} else {
+			LOGSYS_PERROR (errno, LOGSYS_LEVEL_ERROR,
+				"Couldn't create ringid file '%s'", filename);
+
+			corosync_exit_error (COROSYNC_DONE_STORE_RINGID);
+		}
+	}
+
+	totemip_copy(&memb_ring_id->rep, addr);
+	assert (!totemip_zero_check(&memb_ring_id->rep));
+}
+
+static void corosync_ring_id_store (
+	const struct memb_ring_id *memb_ring_id,
+	const struct totem_ip_address *addr)
+{
+	char filename[PATH_MAX];
+	int fd;
+	int res;
+
+	snprintf (filename, sizeof(filename), "%s/ringid_%s",
+		get_run_dir(), totemip_print (addr));
+
+	fd = open (filename, O_WRONLY, 0777);
+	if (fd == -1) {
+		fd = open (filename, O_CREAT|O_RDWR, 0777);
+	}
+	if (fd == -1) {
+		LOGSYS_PERROR(errno, LOGSYS_LEVEL_ERROR,
+			"Couldn't store new ring id %llx to stable storage",
+			memb_ring_id->seq);
+
+		corosync_exit_error (COROSYNC_DONE_STORE_RINGID);
+	}
+	log_printf (LOGSYS_LEVEL_DEBUG,
+		"Storing new sequence id for ring %llx", memb_ring_id->seq);
+	res = write (fd, &memb_ring_id->seq, sizeof(memb_ring_id->seq));
+	close (fd);
+	if (res != sizeof(memb_ring_id->seq)) {
+		LOGSYS_PERROR(errno, LOGSYS_LEVEL_ERROR,
+			"Couldn't store new ring id %llx to stable storage",
+			memb_ring_id->seq);
+
+		corosync_exit_error (COROSYNC_DONE_STORE_RINGID);
+	}
+}
+
 static qb_loop_timer_handle recheck_the_q_level_timer;
 void corosync_recheck_the_q_level(void *data)
 {
@@ -1083,7 +1168,6 @@ int main (int argc, char **argv, char **envp)
 	int res, ch;
 	int background, setprio;
 	struct stat stat_out;
-	char corosync_lib_dir[PATH_MAX];
 	enum e_corosync_done flock_err;
 	uint64_t totem_config_warnings;
 	struct scheduler_pause_timeout_data scheduler_pause_timeout_data;
@@ -1179,10 +1263,16 @@ int main (int argc, char **argv, char **envp)
 	/*
 	 * Make sure required directory is present
 	 */
-	sprintf (corosync_lib_dir, "%s/lib/corosync", LOCALSTATEDIR);
-	res = stat (corosync_lib_dir, &stat_out);
+	res = stat (get_run_dir(), &stat_out);
 	if ((res == -1) || (res == 0 && !S_ISDIR(stat_out.st_mode))) {
-		log_printf (LOGSYS_LEVEL_ERROR, "Required directory not present %s.  Please create it.", corosync_lib_dir);
+		log_printf (LOGSYS_LEVEL_ERROR, "Required directory not present %s.  Please create it.", get_run_dir());
+		corosync_exit_error (COROSYNC_DONE_DIR_NOT_PRESENT);
+	}
+
+	res = chdir(get_run_dir());
+	if (res == -1) {
+		log_printf (LOGSYS_LEVEL_ERROR, "Cannot chdir to run directory %s.  "
+		    "Please make sure it has correct context and rights.", get_run_dir());
 		corosync_exit_error (COROSYNC_DONE_DIR_NOT_PRESENT);
 	}
 
@@ -1221,6 +1311,9 @@ int main (int argc, char **argv, char **envp)
 	}
 
 	ip_version = totem_config.ip_version;
+
+	totem_config.totem_memb_ring_id_create_or_load = corosync_ring_id_create_or_load;
+	totem_config.totem_memb_ring_id_store = corosync_ring_id_store;
 
 	totem_config.totem_logging_configuration = totem_logging_configuration;
 	totem_config.totem_logging_configuration.log_subsys_id = _logsys_subsys_create("TOTEM", "totem,"

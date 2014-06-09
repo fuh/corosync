@@ -58,6 +58,7 @@ enum e_corosync_done {
 	COROSYNC_DONE_ALREADY_RUNNING = 18,
 	COROSYNC_DONE_STD_TO_NULL_REDIR = 19,
 	COROSYNC_DONE_SERVICE_ENGINE_INIT = 20,
+	COROSYNC_DONE_STORE_RINGID = 21,
 	COROSYNC_DONE_PLOAD = 99
 };
 
@@ -78,5 +79,10 @@ extern int cs_name_tisEqual (cs_name_t *str1, char *str2);
  */
 const char * short_service_name_get(uint32_t service_id,
 				    char *buf, size_t buf_size);
+
+/*
+ * Return run directory (ether COROSYNC_RUN_DIR env or LOCALSTATEDIR/lib/corosync)
+ */
+const char *get_run_dir(void);
 
 #endif /* UTIL_H_DEFINED */
