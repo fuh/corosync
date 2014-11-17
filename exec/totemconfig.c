@@ -142,12 +142,21 @@ static void totem_volatile_config_set_value (struct totem_config *totem_config,
 	const char *key_name, const char *deleted_key, unsigned int default_value,
 	int allow_zero_value)
 {
+	char runtime_key_name[ICMAP_KEYNAME_MAXLEN];
 
 	if (icmap_get_uint32(key_name, totem_get_param_by_name(totem_config, key_name)) != CS_OK ||
 	    (deleted_key != NULL && strcmp(deleted_key, key_name) == 0) ||
 	    (!allow_zero_value && *totem_get_param_by_name(totem_config, key_name) == 0)) {
 		*totem_get_param_by_name(totem_config, key_name) = default_value;
 	}
+
+	/*
+	 * Store totem_config value to cmap runtime section
+	 */
+	strcpy(runtime_key_name, "runtime.config.");
+	strcat(runtime_key_name, key_name);
+
+	icmap_set_uint32(runtime_key_name, *totem_get_param_by_name(totem_config, key_name));
 }
 
 
@@ -169,6 +178,11 @@ static void totem_volatile_config_read (struct totem_config *totem_config, const
 		u32 = TOKEN_COEFFICIENT;
 		icmap_get_uint32("totem.token_coefficient", &u32);
 		totem_config->token_timeout += (totem_config->interfaces[0].member_count - 2) * u32;
+
+		/*
+		 * Store totem_config value to cmap runtime section
+		 */
+		icmap_set_uint32("runtime.config.totem.token", totem_config->token_timeout);
 	}
 
 	totem_volatile_config_set_value(totem_config, "totem.max_network_delay", deleted_key, MAX_NETWORK_DELAY, 0);
@@ -228,83 +242,90 @@ static int totem_volatile_config_validate (
 
 	if (totem_config->max_network_delay < MINIMUM_TIMEOUT) {
 		snprintf (local_error_reason, sizeof(local_error_reason),
-			"The max_network_delay parameter (%d ms) may not be less then (%d ms).",
+			"The max_network_delay parameter (%d ms) may not be less than (%d ms).",
 			totem_config->max_network_delay, MINIMUM_TIMEOUT);
 		goto parse_error;
 	}
 
 	if (totem_config->token_timeout < MINIMUM_TIMEOUT) {
 		snprintf (local_error_reason, sizeof(local_error_reason),
-			"The token timeout parameter (%d ms) may not be less then (%d ms).",
+			"The token timeout parameter (%d ms) may not be less than (%d ms).",
 			totem_config->token_timeout, MINIMUM_TIMEOUT);
 		goto parse_error;
 	}
 
 	if (totem_config->token_retransmit_timeout < MINIMUM_TIMEOUT) {
 		snprintf (local_error_reason, sizeof(local_error_reason),
-			"The token retransmit timeout parameter (%d ms) may not be less then (%d ms).",
+			"The token retransmit timeout parameter (%d ms) may not be less than (%d ms).",
 			totem_config->token_retransmit_timeout, MINIMUM_TIMEOUT);
 		goto parse_error;
 	}
 
 	if (totem_config->token_hold_timeout < MINIMUM_TIMEOUT) {
 		snprintf (local_error_reason, sizeof(local_error_reason),
-			"The token hold timeout parameter (%d ms) may not be less then (%d ms).",
+			"The token hold timeout parameter (%d ms) may not be less than (%d ms).",
 			totem_config->token_hold_timeout, MINIMUM_TIMEOUT);
 		goto parse_error;
 	}
 
 	if (totem_config->join_timeout < MINIMUM_TIMEOUT) {
 		snprintf (local_error_reason, sizeof(local_error_reason),
-			"The join timeout parameter (%d ms) may not be less then (%d ms).",
+			"The join timeout parameter (%d ms) may not be less than (%d ms).",
 			totem_config->join_timeout, MINIMUM_TIMEOUT);
 		goto parse_error;
 	}
 
 	if (totem_config->consensus_timeout < MINIMUM_TIMEOUT) {
 		snprintf (local_error_reason, sizeof(local_error_reason),
-			"The consensus timeout parameter (%d ms) may not be less then (%d ms).",
+			"The consensus timeout parameter (%d ms) may not be less than (%d ms).",
 			totem_config->consensus_timeout, MINIMUM_TIMEOUT);
+		goto parse_error;
+	}
+
+	if (totem_config->consensus_timeout < totem_config->join_timeout) {
+		snprintf (local_error_reason, sizeof(local_error_reason),
+			"The consensus timeout parameter (%d ms) may not be less than join timeout (%d ms).",
+			totem_config->consensus_timeout, totem_config->join_timeout);
 		goto parse_error;
 	}
 
 	if (totem_config->merge_timeout < MINIMUM_TIMEOUT) {
 		snprintf (local_error_reason, sizeof(local_error_reason),
-			"The merge timeout parameter (%d ms) may not be less then (%d ms).",
+			"The merge timeout parameter (%d ms) may not be less than (%d ms).",
 			totem_config->merge_timeout, MINIMUM_TIMEOUT);
 		goto parse_error;
 	}
 
 	if (totem_config->downcheck_timeout < MINIMUM_TIMEOUT) {
 		snprintf (local_error_reason, sizeof(local_error_reason),
-			"The downcheck timeout parameter (%d ms) may not be less then (%d ms).",
+			"The downcheck timeout parameter (%d ms) may not be less than (%d ms).",
 			totem_config->downcheck_timeout, MINIMUM_TIMEOUT);
 		goto parse_error;
 	}
 
 	if (totem_config->rrp_problem_count_timeout < MINIMUM_TIMEOUT) {
 		snprintf (local_error_reason, sizeof(local_error_reason),
-			"The RRP problem count timeout parameter (%d ms) may not be less then (%d ms).",
+			"The RRP problem count timeout parameter (%d ms) may not be less than (%d ms).",
 			totem_config->rrp_problem_count_timeout, MINIMUM_TIMEOUT);
 		goto parse_error;
 	}
 
 	if (totem_config->rrp_problem_count_threshold < RRP_PROBLEM_COUNT_THRESHOLD_MIN) {
 		snprintf (local_error_reason, sizeof(local_error_reason),
-			"The RRP problem count threshold (%d problem count) may not be less then (%d problem count).",
+			"The RRP problem count threshold (%d problem count) may not be less than (%d problem count).",
 			totem_config->rrp_problem_count_threshold, RRP_PROBLEM_COUNT_THRESHOLD_MIN);
 		goto parse_error;
 	}
 	if (totem_config->rrp_problem_count_mcast_threshold < RRP_PROBLEM_COUNT_THRESHOLD_MIN) {
 		snprintf (local_error_reason, sizeof(local_error_reason),
-			"The RRP multicast problem count threshold (%d problem count) may not be less then (%d problem count).",
+			"The RRP multicast problem count threshold (%d problem count) may not be less than (%d problem count).",
 			totem_config->rrp_problem_count_mcast_threshold, RRP_PROBLEM_COUNT_THRESHOLD_MIN);
 		goto parse_error;
 	}
 
 	if (totem_config->rrp_token_expired_timeout < MINIMUM_TIMEOUT) {
 		snprintf (local_error_reason, sizeof(local_error_reason),
-			"The RRP token expired timeout parameter (%d ms) may not be less then (%d ms).",
+			"The RRP token expired timeout parameter (%d ms) may not be less than (%d ms).",
 			totem_config->rrp_token_expired_timeout, MINIMUM_TIMEOUT);
 		goto parse_error;
 	}
@@ -389,6 +410,25 @@ static int totem_get_crypto(struct totem_config *totem_config)
 	totem_config->crypto_hash_type = strdup(tmp_hash);
 
 	return 0;
+}
+
+static int totem_config_get_ip_version(void)
+{
+	int res;
+	char *str;
+
+	res = AF_INET;
+	if (icmap_get_string("totem.ip_version", &str) == CS_OK) {
+		if (strcmp(str, "ipv4") == 0) {
+			res = AF_INET;
+		}
+		if (strcmp(str, "ipv6") == 0) {
+			res = AF_INET6;
+		}
+		free(str);
+	}
+
+	return (res);
 }
 
 static uint16_t generate_cluster_id (const char *cluster_name)
@@ -552,29 +592,41 @@ static void put_nodelist_members_to_config(struct totem_config *totem_config)
 	icmap_iter_finalize(iter);
 }
 
-static void config_convert_nodelist_to_interface(struct totem_config *totem_config)
+/*
+ * Tries to find node (node_pos) in config nodelist which address matches any
+ * local interface. Address can be stored in ring0_addr or if ipaddr_key_prefix is not NULL
+ * key with prefix ipaddr_key is used (there can be multiuple of them)
+ * This function differs  * from find_local_node_in_nodelist because it doesn't need bindnetaddr,
+ * but doesn't work when bind addr is network address (so IP must be exact
+ * match).
+ *
+ * Returns 1 on success (address was found, node_pos is then correctly set) or 0 on failure.
+ */
+int totem_config_find_local_addr_in_nodelist(const char *ipaddr_key_prefix, unsigned int *node_pos)
 {
-	icmap_iter_t iter;
-	const char *iter_key;
-	int res = 0;
-	unsigned int node_pos;
-	char tmp_key[ICMAP_KEYNAME_MAXLEN];
-	char tmp_key2[ICMAP_KEYNAME_MAXLEN];
-	char *node_addr_str;
-	unsigned int ringnumber = 0;
 	struct list_head addrs;
-	struct list_head *list;
 	struct totem_ip_if_address *if_addr;
+	icmap_iter_t iter, iter2;
+	const char *iter_key, *iter_key2;
+	struct list_head *list;
+	const char *ipaddr_key;
+	int ip_version;
 	struct totem_ip_address node_addr;
+	char *node_addr_str;
 	int node_found = 0;
+	int res = 0;
+	char tmp_key[ICMAP_KEYNAME_MAXLEN];
 
 	if (totemip_getifaddrs(&addrs) == -1) {
-		return ;
+		return 0;
 	}
 
+	ip_version = totem_config_get_ip_version();
+
 	iter = icmap_iter_init("nodelist.node.");
+
 	while ((iter_key = icmap_iter_next(iter, NULL, NULL)) != NULL) {
-		res = sscanf(iter_key, "nodelist.node.%u.%s", &node_pos, tmp_key);
+		res = sscanf(iter_key, "nodelist.node.%u.%s", node_pos, tmp_key);
 		if (res != 2) {
 			continue;
 		}
@@ -587,24 +639,49 @@ static void config_convert_nodelist_to_interface(struct totem_config *totem_conf
 			continue ;
 		}
 
-		if (totemip_parse(&node_addr, node_addr_str, totem_config->ip_version) == -1) {
-			free(node_addr_str);
-			continue ;
-		}
 		free(node_addr_str);
 
 		/*
-		 * Try to find node in if_addrs
+		 * ring0_addr found -> let's iterate thru ipaddr_key_prefix
 		 */
-		node_found = 0;
-		for (list = addrs.next; list != &addrs; list = list->next) {
-			if_addr = list_entry(list, struct totem_ip_if_address, list);
+		snprintf(tmp_key, sizeof(tmp_key), "nodelist.node.%u.%s", *node_pos,
+		    (ipaddr_key_prefix != NULL ? ipaddr_key_prefix : "ring0_addr"));
 
-			if (totemip_equal(&node_addr, &if_addr->ip_addr)) {
-				node_found = 1;
-				break;
+		iter2 = icmap_iter_init(tmp_key);
+		while ((iter_key2 = icmap_iter_next(iter2, NULL, NULL)) != NULL) {
+			/*
+			 * ring0_addr must be exact match, not prefix
+			 */
+			ipaddr_key = (ipaddr_key_prefix != NULL ? iter_key2 : tmp_key);
+			if (icmap_get_string(ipaddr_key, &node_addr_str) != CS_OK) {
+				continue ;
+			}
+
+			if (totemip_parse(&node_addr, node_addr_str, ip_version) == -1) {
+				free(node_addr_str);
+				continue ;
+			}
+			free(node_addr_str);
+
+			/*
+			 * Try to match ip with if_addrs
+			 */
+			node_found = 0;
+			for (list = addrs.next; list != &addrs; list = list->next) {
+				if_addr = list_entry(list, struct totem_ip_if_address, list);
+
+				if (totemip_equal(&node_addr, &if_addr->ip_addr)) {
+					node_found = 1;
+					break;
+				}
+			}
+
+			if (node_found) {
+				break ;
 			}
 		}
+
+		icmap_iter_finalize(iter2);
 
 		if (node_found) {
 			break ;
@@ -612,8 +689,23 @@ static void config_convert_nodelist_to_interface(struct totem_config *totem_conf
 	}
 
 	icmap_iter_finalize(iter);
+	totemip_freeifaddrs(&addrs);
 
-	if (node_found) {
+	return (node_found);
+}
+
+static void config_convert_nodelist_to_interface(struct totem_config *totem_config)
+{
+	int res = 0;
+	unsigned int node_pos;
+	char tmp_key[ICMAP_KEYNAME_MAXLEN];
+	char tmp_key2[ICMAP_KEYNAME_MAXLEN];
+	char *node_addr_str;
+	unsigned int ringnumber = 0;
+	icmap_iter_t iter;
+	const char *iter_key;
+
+	if (totem_config_find_local_addr_in_nodelist(NULL, &node_pos)) {
 		/*
 		 * We found node, so create interface section
 		 */
@@ -709,16 +801,7 @@ extern int totem_config_read (
 		cluster_name = NULL;
 	}
 
-	totem_config->ip_version = AF_INET;
-	if (icmap_get_string("totem.ip_version", &str) == CS_OK) {
-		if (strcmp(str, "ipv4") == 0) {
-			totem_config->ip_version = AF_INET;
-		}
-		if (strcmp(str, "ipv6") == 0) {
-			totem_config->ip_version = AF_INET6;
-		}
-		free(str);
-	}
+	totem_config->ip_version = totem_config_get_ip_version();
 
 	if (icmap_get_string("totem.interface.0.bindnetaddr", &str) != CS_OK) {
 		/*
@@ -748,7 +831,7 @@ extern int totem_config_read (
 			free(cluster_name);
 
 			snprintf (error_string_response, sizeof(error_string_response),
-			    "parse error in config: interface ring number %u is bigger then allowed maximum %u\n",
+			    "parse error in config: interface ring number %u is bigger than allowed maximum %u\n",
 			    ringnumber, INTERFACE_MAX - 1);
 
 			*error_string = error_string_response;
@@ -911,6 +994,8 @@ extern int totem_config_read (
 	 * Get things that might change in the future (and can depend on totem_config->interfaces);
 	 */
 	totem_volatile_config_read(totem_config, NULL);
+
+	icmap_set_uint8("config.totemconfig_reload_in_progress", 0);
 
 	add_totem_config_notification(totem_config);
 
@@ -1208,7 +1293,7 @@ static void totem_change_notify(
 		return;
 
 	/*
-	 * Values other then UINT32 are not supported, or needed (yet)
+	 * Values other than UINT32 are not supported, or needed (yet)
 	 */
 	switch (event) {
 	case ICMAP_TRACK_DELETE:
@@ -1264,6 +1349,10 @@ static void totem_reload_notify(
 		if (local_node_pos != -1) {
 			icmap_set_uint32("nodelist.local_node_pos", local_node_pos);
 		}
+
+		icmap_set_uint8("config.totemconfig_reload_in_progress", 0);
+	} else {
+		icmap_set_uint8("config.totemconfig_reload_in_progress", 1);
 	}
 }
 

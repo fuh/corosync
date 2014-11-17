@@ -252,12 +252,34 @@ static void sigsegv_handler (int num)
 	raise (SIGSEGV);
 }
 
+/*
+ * QB wrapper for real signal handler
+ */
+static int32_t sig_segv_handler (int num, void *data)
+{
+
+	sigsegv_handler(num);
+
+	return 0;
+}
+
 static void sigabrt_handler (int num)
 {
 	(void)signal (SIGABRT, SIG_DFL);
 	corosync_blackbox_write_to_file ();
 	qb_log_fini();
 	raise (SIGABRT);
+}
+
+/*
+ * QB wrapper for real signal handler
+ */
+static int32_t sig_abrt_handler (int num, void *data)
+{
+
+	sigabrt_handler(num);
+
+	return 0;
 }
 
 #define LOCALHOST_IP inet_addr("127.0.0.1")
@@ -1039,6 +1061,7 @@ static void set_icmap_ro_keys_flag (void)
 	icmap_set_ro_access("runtime.connections.", CS_TRUE, CS_TRUE);
 	icmap_set_ro_access("runtime.totem.", CS_TRUE, CS_TRUE);
 	icmap_set_ro_access("runtime.services.", CS_TRUE, CS_TRUE);
+	icmap_set_ro_access("runtime.config.", CS_TRUE, CS_TRUE);
 
 	/*
 	 * Set RO flag for constrete keys of configuration which can't be changed
@@ -1051,6 +1074,8 @@ static void set_icmap_ro_keys_flag (void)
 	icmap_set_ro_access("totem.rrp_mode", CS_FALSE, CS_TRUE);
 	icmap_set_ro_access("totem.netmtu", CS_FALSE, CS_TRUE);
 	icmap_set_ro_access("qb.ipc_type", CS_FALSE, CS_TRUE);
+	icmap_set_ro_access("config.reload_in_progress", CS_FALSE, CS_TRUE);
+	icmap_set_ro_access("config.totemconfig_reload_in_progress", CS_FALSE, CS_TRUE);
 }
 
 static void main_service_ready (void)
@@ -1166,7 +1191,7 @@ int main (int argc, char **argv, char **envp)
 	const char *error_string;
 	struct totem_config totem_config;
 	int res, ch;
-	int background, setprio;
+	int background, setprio, testonly;
 	struct stat stat_out;
 	enum e_corosync_done flock_err;
 	uint64_t totem_config_warnings;
@@ -1176,8 +1201,9 @@ int main (int argc, char **argv, char **envp)
 	 */
 	background = 1;
 	setprio = 0;
+	testonly = 0;
 
-	while ((ch = getopt (argc, argv, "fprv")) != EOF) {
+	while ((ch = getopt (argc, argv, "fprtv")) != EOF) {
 
 		switch (ch) {
 			case 'f':
@@ -1188,9 +1214,13 @@ int main (int argc, char **argv, char **envp)
 			case 'r':
 				setprio = 1;
 				break;
+			case 't':
+				testonly = 1;
+				break;
 			case 'v':
 				printf ("Corosync Cluster Engine, version '%s'\n", VERSION);
 				printf ("Copyright (c) 2006-2009 Red Hat, Inc.\n");
+				logsys_system_fini();
 				return EXIT_SUCCESS;
 
 				break;
@@ -1199,8 +1229,10 @@ int main (int argc, char **argv, char **envp)
 					"usage:\n"\
 					"        -f     : Start application in foreground.\n"\
 					"        -p     : Does nothing.    \n"\
+					"        -t     : Test configuration and exit.\n"\
 					"        -r     : Set round robin realtime scheduling \n"\
 					"        -v     : Display version and SVN revision of Corosync and exit.\n");
+				logsys_system_fini();
 				return EXIT_FAILURE;
 		}
 	}
@@ -1257,8 +1289,10 @@ int main (int argc, char **argv, char **envp)
 		corosync_exit_error (COROSYNC_DONE_LOGCONFIGREAD);
 	}
 
-	log_printf (LOGSYS_LEVEL_NOTICE, "Corosync Cluster Engine ('%s'): started and ready to provide service.", VERSION);
-	log_printf (LOGSYS_LEVEL_INFO, "Corosync built-in features:" PACKAGE_FEATURES "");
+	if (!testonly) {
+		log_printf (LOGSYS_LEVEL_NOTICE, "Corosync Cluster Engine ('%s'): started and ready to provide service.", VERSION);
+		log_printf (LOGSYS_LEVEL_INFO, "Corosync built-in features:" PACKAGE_FEATURES "");
+	}
 
 	/*
 	 * Make sure required directory is present
@@ -1310,6 +1344,10 @@ int main (int argc, char **argv, char **envp)
 		corosync_exit_error (COROSYNC_DONE_MAINCONFIGREAD);
 	}
 
+	if (testonly) {
+		corosync_exit_error (COROSYNC_DONE_EXIT);
+	}
+
 	ip_version = totem_config.ip_version;
 
 	totem_config.totem_memb_ring_id_create_or_load = corosync_ring_id_create_or_load;
@@ -1346,6 +1384,10 @@ int main (int argc, char **argv, char **envp)
 		SIGUSR2, NULL, sig_diag_handler, NULL);
 	qb_loop_signal_add(corosync_poll_handle, QB_LOOP_HIGH,
 		SIGINT, NULL, sig_exit_handler, NULL);
+	qb_loop_signal_add(corosync_poll_handle, QB_LOOP_HIGH,
+		SIGSEGV, NULL, sig_segv_handler, NULL);
+	qb_loop_signal_add(corosync_poll_handle, QB_LOOP_HIGH,
+		SIGABRT, NULL, sig_abrt_handler, NULL);
 	qb_loop_signal_add(corosync_poll_handle, QB_LOOP_HIGH,
 		SIGQUIT, NULL, sig_exit_handler, NULL);
 	qb_loop_signal_add(corosync_poll_handle, QB_LOOP_HIGH,
