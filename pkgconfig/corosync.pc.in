@@ -2,6 +2,8 @@ prefix=@PREFIX@
 exec_prefix=${prefix}
 libdir=@LIBDIR@
 includedir=${prefix}/include
+logdir=@LOGDIR@
+corosysconfdir=@COROSYSCONFDIR@
 
 Name: corosync
 Version: @LIBVERSION@

@@ -61,7 +61,7 @@ typedef enum {
 	OPER_FULL_OUTPUT = 2,
 } operation_t;
 
-static void fprint_addrs(FILE *f, int nodeid)
+static void fprint_addrs(FILE *f, unsigned int nodeid)
 {
 	int numaddrs;
 	int i;
@@ -75,10 +75,15 @@ static void fprint_addrs(FILE *f, int nodeid)
 			struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)addrs[i].address;
 			void *saddr;
 
-			if (ss->ss_family == AF_INET6)
+			if (!ss->ss_family) {
+				continue;
+			}
+
+			if (ss->ss_family == AF_INET6) {
 				saddr = &sin6->sin6_addr;
-			else
+			} else {
 				saddr = &sin->sin_addr;
+			}
 
 			inet_ntop(ss->ss_family, saddr, buf, sizeof(buf));
 			if (i != 0) {
@@ -198,7 +203,7 @@ static void usage_do (const char *prog_name)
 	printf ("A tool for displaying cpg groups and members.\n");
 	printf ("options:\n");
 	printf ("\t-d\tDelimiter between fields.\n");
-	printf ("\t-e\tDon't escape unprintable characters in group name\n");
+	printf ("\t-e\tDon't escape unprintable characters in group name.\n");
 	printf ("\t-n\tDisplay only all existing group names.\n");
 	printf ("\t-h\tDisplay this help.\n");
 }

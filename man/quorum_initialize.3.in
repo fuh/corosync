@@ -1,5 +1,5 @@
 .\"/*
-.\" * Copyright (c) 2012 Red Hat, Inc.
+.\" * Copyright (c) 2012-2020 Red Hat, Inc.
 .\" *
 .\" * All rights reserved.
 .\" *
@@ -51,7 +51,7 @@ argument to uniquely identify the connection.  The
 argument is then used in other function calls to identify the connection to be used
 for communication with the quorum service.
 .PP
-Every time the voting configuraton changes (eg a node joins or leave the cluster) or the quorum status change,
+Every time the voting configuration changes (eg a node joins or leave the cluster) or the quorum status change,
 the callback is called.
 The callback function is described by the following type definitions:
 
@@ -101,7 +101,8 @@ This call returns the CS_OK value if successful, otherwise an error is returned.
 .SH ERRORS
 @COMMONIPCERRORS@
 .SH "SEE ALSO"
-.BR quorum_overview (8),
+.BR quorum_overview (3),
+.BR quorum_model_initialize (3),
 .BR quorum_finalize (3),
 .BR quorum_getquorate (3),
 .BR quorum_trackstart (3),

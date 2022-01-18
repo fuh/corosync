@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2009-2014 Red Hat, Inc.
+ * Copyright (c) 2009-2020 Red Hat, Inc.
  *
  * All rights reserved.
  *
@@ -48,6 +48,7 @@
 #include <corosync/cmap.h>
 #include <corosync/quorum.h>
 #include <corosync/votequorum.h>
+#include "util.h"
 
 typedef enum {
 	NODEID_FORMAT_DECIMAL,
@@ -60,7 +61,6 @@ typedef enum {
 } name_format_t;
 
 typedef enum {
-	CMD_UNKNOWN,
 	CMD_SHOWNODES,
 	CMD_SHOWSTATUS,
 	CMD_SETVOTES,
@@ -74,6 +74,8 @@ typedef enum {
 	SORT_NODEID,
 	SORT_NODENAME
 } sorttype_t;
+
+#define EXIT_NOT_QUORATE	2
 
 /*
  * global vars
@@ -114,16 +116,26 @@ typedef struct {
 static view_list_entry_t *g_view_list;
 static uint32_t g_quorate;
 static uint64_t g_ring_id;
+static uint32_t g_ring_id_rep_node;
 static uint32_t g_view_list_entries;
 static uint32_t g_called;
+static uint32_t g_vq_called;
+static uint32_t g_show_all_addrs = 0;
 
 /*
  * votequorum bits
  */
+static void votequorum_notification_fn(
+	votequorum_handle_t handle,
+	uint64_t context,
+	votequorum_ring_id_t ring_id,
+	uint32_t node_list_entries,
+	uint32_t node_list[]);
 static votequorum_handle_t v_handle;
 static votequorum_callbacks_t v_callbacks = {
-	.votequorum_notify_fn = NULL,
-	.votequorum_expectedvotes_notify_fn = NULL
+	.votequorum_quorum_notify_fn = NULL,
+	.votequorum_expectedvotes_notify_fn = NULL,
+	.votequorum_nodelist_notify_fn = votequorum_notification_fn,
 };
 static uint32_t our_nodeid = 0;
 
@@ -148,15 +160,16 @@ static void show_usage(const char *name)
 	printf("  options:\n");
 	printf("\n");
 	printf("  -s             show quorum status\n");
-	printf("  -m             monitor quorum status\n");
+	printf("  -m             constantly monitor quorum status\n");
 	printf("  -l             list nodes\n");
+	printf("  -a             show all names or addresses for each node\n");
 	printf("  -p             when used with -s or -l, generates machine parsable output\n");
 	printf("  -v <votes>     change the number of votes for a node (*)\n");
-	printf("  -n <nodeid>    optional nodeid of node for -v (*)\n");
+	printf("  -n <nodeid>    optional nodeid of node for -v\n");
 	printf("  -e <expected>  change expected votes for the cluster (*)\n");
 	printf("  -H             show nodeids in hexadecimal rather than decimal\n");
 	printf("  -i             show node IP addresses instead of the resolved name\n");
-	printf("  -o <a|i>       order by [a] IP address (default), [i] nodeid,\n");
+	printf("  -o <a|n|i>     order by [a] IP address (default), [n] name, [i] nodeid\n");
 	printf("  -f             forcefully unregister a quorum device *DANGEROUS* (*)\n");
 	printf("  -h             show this help text\n");
 	printf("  -V             show version and exit\n");
@@ -223,11 +236,11 @@ static int set_votes(uint32_t nodeid, int votes)
 	int err;
 
 	if ((err=votequorum_setvotes(v_handle, nodeid, votes)) != CS_OK) {
-		fprintf(stderr, "Unable to set votes %d for nodeid: %u: %s\n",
+		fprintf(stderr, "Unable to set votes %d for nodeid: " CS_PRI_NODE_ID ": %s\n",
 			votes, nodeid, cs_strerror(err));
 	}
 
-	return err==CS_OK?0:err;
+	return (err == CS_OK ? EXIT_SUCCESS : EXIT_FAILURE);
 }
 
 static int set_expected(int expected_votes)
@@ -238,7 +251,7 @@ static int set_expected(int expected_votes)
 		fprintf(stderr, "Unable to set expected votes: %s\n", cs_strerror(err));
 	}
 
-	return err==CS_OK?0:err;
+	return (err == CS_OK ? EXIT_SUCCESS : EXIT_FAILURE);
 }
 
 /*
@@ -248,8 +261,8 @@ static int set_expected(int expected_votes)
 static const char *node_name_by_nodelist(uint32_t nodeid)
 {
 	cmap_iter_handle_t iter;
-	char key_name[CMAP_KEYNAME_MAXLEN];
-	char tmp_key[CMAP_KEYNAME_MAXLEN];
+	char key_name[CMAP_KEYNAME_MAXLEN + 1];
+	char tmp_key[CMAP_KEYNAME_MAXLEN + 1];
 	static char ret_buf[_POSIX_HOST_NAME_MAX];
 	char *str = NULL;
 	uint32_t node_pos, cur_nodeid;
@@ -268,7 +281,7 @@ static const char *node_name_by_nodelist(uint32_t nodeid)
 			continue;
 		}
 
-		if (strcmp(tmp_key, "ring0_addr") != 0) {
+		if (strcmp(tmp_key, "nodeid") != 0) {
 			continue;
 		}
 
@@ -279,7 +292,7 @@ static const char *node_name_by_nodelist(uint32_t nodeid)
 		if (cur_nodeid != nodeid) {
 			continue;
 		}
-		snprintf(tmp_key, CMAP_KEYNAME_MAXLEN, "nodelist.node.%u.ring0_addr", node_pos);
+		snprintf(tmp_key, CMAP_KEYNAME_MAXLEN, "nodelist.node.%u.name", node_pos);
 		if (cmap_get_string(cmap_handle, tmp_key, &str) != CS_OK) {
 			continue;
 		}
@@ -304,43 +317,80 @@ static const char *node_name(uint32_t nodeid, name_format_t name_format)
 	int err;
 	int numaddrs;
 	corosync_cfg_node_address_t addrs[INTERFACE_MAX];
-	static char buf[INET6_ADDRSTRLEN];
+	static char buf[(INET6_ADDRSTRLEN + 1) * KNET_MAX_LINK];
 	const char *nodelist_name = NULL;
 	socklen_t addrlen;
 	struct sockaddr_storage *ss;
+	int start_addr = 0;
+	int i;
+	int bufptr = 0;
 
+	buf[0] = '\0';
+
+	/* If a name is required, always look for the nodelist node0_addr name first */
 	if (name_format == ADDRESS_FORMAT_NAME) {
 		nodelist_name = node_name_by_nodelist(nodeid);
 	}
-
 	if ((nodelist_name) &&
 	    (strlen(nodelist_name) > 0)) {
-		return nodelist_name;
+		start_addr = 1;
+		assert(strlen(nodelist_name) < sizeof(buf));
+		strcpy(buf, nodelist_name);
+		bufptr = strlen(buf);
 	}
 
 	err = corosync_cfg_get_node_addrs(c_handle, nodeid, INTERFACE_MAX, &numaddrs, addrs);
 	if (err != CS_OK) {
-		fprintf(stderr, "Unable to get node address for nodeid %u: %s\n", nodeid, cs_strerror(err));
+		fprintf(stderr, "Unable to get node address for nodeid " CS_PRI_NODE_ID ": %s\n", nodeid, cs_strerror(err));
 		return "";
 	}
 
-	ss = (struct sockaddr_storage *)addrs[0].address;
-
-	if (ss->ss_family == AF_INET6) {
-		addrlen = sizeof(struct sockaddr_in6);
-	} else {
-		addrlen = sizeof(struct sockaddr_in);
+	/* Don't show all addressess */
+	if (!g_show_all_addrs) {
+		numaddrs = 1;
 	}
 
-	if (!getnameinfo(
-		(struct sockaddr *)addrs[0].address, addrlen,
-		buf, sizeof(buf),
-		NULL, 0,
-		(name_format == ADDRESS_FORMAT_IP)?NI_NUMERICHOST:0)) {
-			return buf;
+	for (i=start_addr; i<numaddrs; i++) {
+
+		ss = (struct sockaddr_storage *)addrs[i].address;
+
+		if (!ss->ss_family) {
+			continue;
+		}
+
+		if (ss->ss_family == AF_INET6) {
+			addrlen = sizeof(struct sockaddr_in6);
+		} else {
+			addrlen = sizeof(struct sockaddr_in);
+		}
+
+		if (i) {
+			buf[bufptr++] = ',';
+			buf[bufptr++] = ' ';
+		}
+
+		if (!getnameinfo(
+			    (struct sockaddr *)addrs[i].address, addrlen,
+			    buf+bufptr, sizeof(buf)-bufptr,
+			    NULL, 0,
+			    (name_format == ADDRESS_FORMAT_IP)?NI_NUMERICHOST:0)) {
+			bufptr += strlen(buf+bufptr);
+		}
 	}
 
-	return "";
+	return buf;
+}
+
+
+static void votequorum_notification_fn(
+	votequorum_handle_t handle,
+	uint64_t context,
+	votequorum_ring_id_t ring_id,
+	uint32_t node_list_entries,
+	uint32_t node_list[])
+{
+	g_ring_id_rep_node = ring_id.nodeid;
+	g_vq_called = 1;
 }
 
 static void quorum_notification_fn(
@@ -416,6 +466,7 @@ static int compare_nodenames(const void *one, const void *two)
 static void display_nodes_data(nodeid_format_t nodeid_format, name_format_t name_format, sorttype_t sort_type)
 {
 	int i, display_qdevice = 0;
+	unsigned int our_flags = 0;
 	struct votequorum_info info[g_view_list_entries];
 	/*
 	 * cache node info because we need to parse them twice
@@ -423,7 +474,7 @@ static void display_nodes_data(nodeid_format_t nodeid_format, name_format_t name
 	if (v_handle) {
 		for (i=0; i < g_view_list_entries; i++) {
 			if (votequorum_getinfo(v_handle, g_view_list[i].node_id, &info[i]) != CS_OK) {
-				printf("Unable to get node %u info\n", g_view_list[i].node_id);
+				printf("Unable to get node " CS_PRI_NODE_ID " info\n", g_view_list[i].node_id);
 			}
 			g_view_list[i].vq_info = &info[i];
 			if (info[i].flags & VOTEQUORUM_INFO_QDEVICE_REGISTERED) {
@@ -432,7 +483,7 @@ static void display_nodes_data(nodeid_format_t nodeid_format, name_format_t name
 		}
 	}
 
-	/* 
+	/*
 	 * Get node names
 	 */
 	for (i=0; i < g_view_list_entries; i++) {
@@ -474,7 +525,7 @@ static void display_nodes_data(nodeid_format_t nodeid_format, name_format_t name
 				if (info[i].flags & VOTEQUORUM_INFO_QDEVICE_REGISTERED) {
 					char buf[10];
 
-					snprintf(buf, sizeof(buf) - 1,
+					snprintf(buf, sizeof(buf),
 						 "%s,%s,%s",
 						 info[i].flags & VOTEQUORUM_INFO_QDEVICE_ALIVE?"A":"NA",
 						 info[i].flags & VOTEQUORUM_INFO_QDEVICE_CAST_VOTE?"V":"NV",
@@ -488,6 +539,9 @@ static void display_nodes_data(nodeid_format_t nodeid_format, name_format_t name
 		printf("%s", g_view_list[i].name);
 		if (g_view_list[i].node_id == our_nodeid) {
 			printf(" (local)");
+			if (v_handle) {
+				our_flags = info[i].flags;
+			}
 		}
 		printf("\n");
 	}
@@ -506,8 +560,21 @@ static void display_nodes_data(nodeid_format_t nodeid_format, name_format_t name
 		} else {
 			printf("0x%08x ", VOTEQUORUM_QDEVICE_NODEID);
 		}
-		print_uint32_padded(info[0].qdevice_votes);
-		printf("           %s\n", info[0].qdevice_name);
+		/* If the quorum device is inactive on this node then show votes as 0
+		   so that the display is not confusing */
+		if (our_flags & VOTEQUORUM_INFO_QDEVICE_CAST_VOTE) {
+			print_uint32_padded(info[0].qdevice_votes);
+		}
+		else {
+			print_uint32_padded(0);
+		}
+		printf("           %s", info[0].qdevice_name);
+		if (our_flags & VOTEQUORUM_INFO_QDEVICE_CAST_VOTE) {
+			printf("\n");
+		}
+		else {
+			printf(" (votes %d)\n", info[0].qdevice_votes);
+		}
 	}
 
 }
@@ -534,11 +601,17 @@ static int display_quorum_data(int is_quorate,
 	printf("Quorum provider:  %s\n", quorumtype);
 	printf("Nodes:            %d\n", g_view_list_entries);
 	if (nodeid_format == NODEID_FORMAT_DECIMAL) {
-		printf("Node ID:          %u\n", our_nodeid);
+		printf("Node ID:          " CS_PRI_NODE_ID "\n", our_nodeid);
 	} else {
 		printf("Node ID:          0x%08x\n", our_nodeid);
 	}
-	printf("Ring ID:          %" PRIu64 "\n", g_ring_id);
+
+	if (v_handle) {
+		printf("Ring ID:          " CS_PRI_RING_ID "\n", g_ring_id_rep_node, g_ring_id);
+	}
+	else {
+		printf("Ring ID:          " CS_PRI_RING_ID_SEQ "\n", g_ring_id);
+	}
 	printf("Quorate:          %s\n", is_quorate?"Yes":"No");
 
 	if (!v_handle) {
@@ -572,9 +645,9 @@ static int display_quorum_data(int is_quorate,
 }
 
 /*
- * return  1 if quorate
- *         0 if not quorate
- *        -1 on error
+ * return EXIT_SUCCESS if quorate
+ *        EXIT_NOT_QUORATE if not quorate
+ *        EXIT_FAILURE on error
  */
 static int show_status(nodeid_format_t nodeid_format, name_format_t name_format, sorttype_t sort_type)
 {
@@ -605,17 +678,33 @@ static int show_status(nodeid_format_t nodeid_format, name_format_t name_format,
 		fprintf(stderr, "Unable to stop quorum status tracking: %s\n", cs_strerror(err));
 	}
 
+	if (using_votequorum()) {
+
+		if ( (err=votequorum_trackstart(v_handle, 0LL, CS_TRACK_CURRENT)) != CS_OK) {
+			fprintf(stderr, "Unable to start votequorum status tracking: %s\n", cs_strerror(err));
+			goto quorum_err;
+		}
+
+		g_vq_called = 0;
+		while (g_vq_called == 0 && err == CS_OK) {
+			err = votequorum_dispatch(v_handle, CS_DISPATCH_ONE);
+			if (err != CS_OK) {
+				fprintf(stderr, "Unable to dispatch votequorum status: %s\n", cs_strerror(err));
+			}
+		}
+	}
+
 quorum_err:
 	if (err != CS_OK) {
-		return -1;
+		return EXIT_FAILURE;
 	}
 
 	err = display_quorum_data(is_quorate, nodeid_format, name_format, sort_type, 0);
 	if (err != CS_OK) {
-		return -1;
+		return EXIT_FAILURE;
 	}
 
-	return is_quorate;
+	return (is_quorate ? EXIT_SUCCESS : EXIT_NOT_QUORATE);
 }
 
 static int monitor_status(nodeid_format_t nodeid_format, name_format_t name_format, sorttype_t sort_type) {
@@ -633,12 +722,31 @@ static int monitor_status(nodeid_format_t nodeid_format, name_format_t name_form
 		goto quorum_err;
 	}
 
+	if (using_votequorum()) {
+		if ( (err=votequorum_trackstart(v_handle, 0LL, CS_TRACK_CHANGES)) != CS_OK) {
+			fprintf(stderr, "Unable to start votequorum status tracking: %s\n", cs_strerror(err));
+			goto quorum_err;
+		}
+	}
+
+
 	while (1) {
 		err = quorum_dispatch(q_handle, CS_DISPATCH_ONE);
 		if (err != CS_OK) {
 			fprintf(stderr, "Unable to dispatch quorum status: %s\n", cs_strerror(err));
 			goto quorum_err;
 		}
+		if (using_votequorum()) {
+			g_vq_called = 0;
+			while (!g_vq_called) {
+				err = votequorum_dispatch(v_handle, CS_DISPATCH_ONE);
+				if (err != CS_OK) {
+					fprintf(stderr, "Unable to dispatch votequorum status: %s\n", cs_strerror(err));
+					goto quorum_err;
+				}
+			}
+		}
+
 		err = display_quorum_data(g_quorate, nodeid_format, name_format, sort_type, loop);
 		printf("\n");
 		loop = 1;
@@ -649,7 +757,7 @@ static int monitor_status(nodeid_format_t nodeid_format, name_format_t name_form
 	}
 
 quorum_err:
-	return -1;
+	return EXIT_FAILURE;
 }
 
 static int show_nodes(nodeid_format_t nodeid_format, name_format_t name_format, sorttype_t sort_type)
@@ -683,23 +791,30 @@ static int unregister_qdevice(void)
 {
 	int err;
 	struct votequorum_info info;
+	int result;
+
+	result = EXIT_FAILURE;
 
 	err = votequorum_getinfo(v_handle, our_nodeid, &info);
 	if (err != CS_OK) {
 		fprintf(stderr, "Unable to get quorum device info: %s\n", cs_strerror(err));
-		return -1;
+		goto err_exit;
 	}
 
 	if (!(info.flags & VOTEQUORUM_INFO_QDEVICE_REGISTERED)) {
-		return 0;
+		result = EXIT_SUCCESS;
+		goto err_exit;
 	}
 
 	err = votequorum_qdevice_unregister(v_handle, info.qdevice_name);
 	if (err != CS_OK) {
 		fprintf(stderr, "Unable to unregister quorum device: %s\n", cs_strerror(err));
-		return -1;
+		goto err_exit;
 	}
-	return 0;
+
+	result = EXIT_SUCCESS;
+err_exit:
+	return result;
 }
 
 /*
@@ -742,7 +857,7 @@ static int init_all(void) {
 	}
 
 	if (cmap_get_uint32(cmap_handle, "runtime.votequorum.this_node_id", &our_nodeid) != CS_OK) {
-		fprintf(stderr, "Unable to retrive this node nodeid\n");
+		fprintf(stderr, "Unable to retrieve this_node_id\n");
 		goto out;
 	}
 
@@ -767,8 +882,7 @@ static void close_all(void) {
 }
 
 int main (int argc, char *argv[]) {
-	const char *options = "VHslpmfe:v:hin:o:";
-	char *endptr;
+	const char *options = "VHaslpmfe:v:hin:o:";
 	int opt;
 	int votes = 0;
 	int ret = 0;
@@ -778,26 +892,18 @@ int main (int argc, char *argv[]) {
 	name_format_t address_format = ADDRESS_FORMAT_NAME;
 	command_t command_opt = CMD_SHOWSTATUS;
 	sorttype_t sort_opt = SORT_ADDR;
-	char sortchar;
-	long int l;
-
-	if (init_all()) {
-		close_all();
-		exit(1);
-	}
+	long long int l;
 
 	while ( (opt = getopt(argc, argv, options)) != -1 ) {
 		switch (opt) {
 		case 'f':
-			if (using_votequorum() > 0) {
-				command_opt = CMD_UNREGISTER_QDEVICE;
-			} else {
-				fprintf(stderr, "You cannot unregister quorum device, corosync is not using votequorum\n");
-				exit(2);
-			}
+			command_opt = CMD_UNREGISTER_QDEVICE;
 			break;
 		case 's':
 			command_opt = CMD_SHOWSTATUS;
+			break;
+		case 'a':
+			g_show_all_addrs = 1;
 			break;
 		case 'm':
 			command_opt = CMD_MONITOR;
@@ -815,74 +921,64 @@ int main (int argc, char *argv[]) {
 			machine_parsable = 1;
 			break;
 		case 'e':
-			if (using_votequorum() > 0) {
-				votes = strtol(optarg, &endptr, 0);
-				if ((votes == 0 && endptr == optarg) || votes <= 0) {
-					fprintf(stderr, "New expected votes value was not valid, try a positive number\n");
-				} else {
-					command_opt = CMD_SETEXPECTED;
-				}
-			} else {
-				fprintf(stderr, "You cannot change expected votes, corosync is not using votequorum\n");
-				exit(2);
+			if (util_strtonum(optarg, 1, INT_MAX, &l) == -1) {
+				fprintf(stderr, "New expected votes value was not valid, try a positive number\n");
+				exit(EXIT_FAILURE);
 			}
+			votes = l;
+			command_opt = CMD_SETEXPECTED;
 			break;
 		case 'n':
-			l = strtol(optarg, &endptr, 0);
-			if ((l == 0 && endptr == optarg) || l < 0) {
+			if (util_strtonum(optarg, 1, UINT_MAX, &l) == -1) {
 				fprintf(stderr, "The nodeid was not valid, try a positive number\n");
-				exit(2);
+				exit(EXIT_FAILURE);
 			}
 			nodeid = l;
 			nodeid_set = 1;
 			break;
 		case 'v':
-			if (using_votequorum() > 0) {
-				votes = strtol(optarg, &endptr, 0);
-				if ((votes == 0 && endptr == optarg) || votes < 0) {
-					fprintf(stderr, "New votes value was not valid, try a positive number or zero\n");
-					exit(2);
-				} else {
-					command_opt = CMD_SETVOTES;
-				}
+			if (util_strtonum(optarg, 0, INT_MAX, &l) == -1) {
+				fprintf(stderr, "New votes value was not valid, try a positive number or zero\n");
+				exit(EXIT_FAILURE);
 			}
-			else {
-				fprintf(stderr, "You cannot change node votes, corosync is not using votequorum\n");
-				exit(2);
-			}
+			votes = l;
+			command_opt = CMD_SETVOTES;
 			break;
 		case 'o':
-			sortchar = optarg[0];
-			switch (sortchar) {
-			        case 'a': sort_opt = SORT_ADDR;
-					break;
-			        case 'i': sort_opt = SORT_NODEID;
-					break;
-			        case 'n': sort_opt = SORT_NODENAME;
-					break;
-			        default:
-					fprintf(stderr, "Invalid ordering option. valid orders are a(address), i(node ID) or n(name)\n");
-					exit(2);
-					break;
+			if (strcmp(optarg, "a") == 0) {
+				sort_opt = SORT_ADDR;
+			} else if (strcmp(optarg, "i") == 0) {
+				sort_opt = SORT_NODEID;
+			} else if (strcmp(optarg, "n") == 0) {
+				sort_opt = SORT_NODENAME;
+			} else {
+				fprintf(stderr, "Invalid ordering option. valid orders are a(address), i(node ID) or n(name)\n");
+				exit(EXIT_FAILURE);
 			}
 			break;
 		case 'V':
 			printf("corosync-quorumtool version: %s\n", VERSION);
-			exit(0);
-		case ':':
+			exit(EXIT_SUCCESS);
+			break;
 		case 'h':
+			show_usage(argv[0]);
+			exit(EXIT_SUCCESS);
+			break;
+		case ':':
 		case '?':
 		default:
-			command_opt = CMD_UNKNOWN;
+			show_usage(argv[0]);
+			exit(EXIT_FAILURE);
 			break;
 		}
 	}
 
+	if (init_all()) {
+		close_all();
+		exit(EXIT_FAILURE);
+	}
+
 	switch (command_opt) {
-	case CMD_UNKNOWN:
-		show_usage(argv[0]);
-		ret = -1;
-		break;
 	case CMD_SHOWNODES:
 		ret = show_nodes(nodeid_format, address_format, sort_opt);
 		break;
@@ -890,19 +986,34 @@ int main (int argc, char *argv[]) {
 		ret = show_status(nodeid_format, address_format, sort_opt);
 		break;
 	case CMD_SETVOTES:
-		if (!nodeid_set) {
-			nodeid = our_nodeid;
+		if (using_votequorum() > 0) {
+			if (!nodeid_set) {
+				nodeid = our_nodeid;
+			}
+			ret = set_votes(nodeid, votes);
+		} else {
+			fprintf(stderr, "You cannot change node votes, corosync is not using votequorum\n");
+			ret = EXIT_FAILURE;
 		}
-		ret = set_votes(nodeid, votes);
 		break;
 	case CMD_SETEXPECTED:
-		ret = set_expected(votes);
+		if (using_votequorum() > 0) {
+			ret = set_expected(votes);
+		} else {
+			fprintf(stderr, "You cannot change expected votes, corosync is not using votequorum\n");
+			ret = EXIT_FAILURE;
+		}
 		break;
 	case CMD_MONITOR:
 		ret = monitor_status(nodeid_format, address_format, sort_opt);
 		break;
 	case CMD_UNREGISTER_QDEVICE:
-		ret = unregister_qdevice();
+		if (using_votequorum() > 0) {
+			ret = unregister_qdevice();
+		} else {
+			fprintf(stderr, "You cannot unregister quorum device, corosync is not using votequorum\n");
+			ret = EXIT_FAILURE;
+		}
 		break;
 	}
 

@@ -43,7 +43,7 @@ The
 .B votequorum_trackstart
 function is used to enable callbacks notification from the votequorum API.
 .PP
-Every time the voting configuraton changes (eg a node joins or leave the cluster)
+Every time the voting configuration changes (eg a node joins or leave the cluster)
 or the quorum status change or the expected votes changes, the notification is queued.
 .PP
 The notification is dispatched via
@@ -52,7 +52,7 @@ function that will execute the callback.
 .PP
 The
 .I context
-option allows to set a tracking context.
+option allows one to set a tracking context.
 .PP
 The
 .I flags
@@ -69,7 +69,7 @@ This call returns the CS_OK value if successful, otherwise an error is returned.
 .SH ERRORS
 @COMMONIPCERRORS@
 .SH "SEE ALSO"
-.BR votequorum_overview (8),
+.BR votequorum_overview (3),
 .BR votequorum_initialize (3),
 .BR votequorum_finalize (3),
 .BR votequorum_getinfo (3),

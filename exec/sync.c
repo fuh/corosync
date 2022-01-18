@@ -45,8 +45,6 @@
 #include <stdio.h>
 #include <errno.h>
 #include <time.h>
-#include <unistd.h>
-#include <netinet/in.h>
 #include <arpa/inet.h>
 
 #include <corosync/corotypes.h>
@@ -64,10 +62,8 @@ LOGSYS_DECLARE_SUBSYS ("SYNC");
 
 #define MESSAGE_REQ_SYNC_BARRIER 0
 #define MESSAGE_REQ_SYNC_SERVICE_BUILD 1
-#define MESSAGE_REQ_SYNC_MEMB_DETERMINE 2
 
 enum sync_process_state {
-	INIT,
 	PROCESS,
 	ACTIVATE
 };
@@ -98,11 +94,6 @@ struct processor_entry {
 	int received;
 };
 
-struct req_exec_memb_determine_message {
-	struct qb_ipc_request_header header __attribute__((aligned(8)));
-	struct memb_ring_id ring_id __attribute__((aligned(8)));
-};
-
 struct req_exec_service_build_message {
 	struct qb_ipc_request_header header __attribute__((aligned(8)));
 	struct memb_ring_id ring_id __attribute__((aligned(8)));
@@ -118,14 +109,6 @@ struct req_exec_barrier_message {
 static enum sync_state my_state = SYNC_BARRIER;
 
 static struct memb_ring_id my_ring_id;
-
-static struct memb_ring_id my_memb_determine_ring_id;
-
-static int my_memb_determine = 0;
-
-static unsigned int my_memb_determine_list[PROCESSOR_COUNT_MAX];
-
-static unsigned int my_memb_determine_list_entries = 0;
 
 static int my_processing_idx = 0;
 
@@ -147,8 +130,6 @@ static struct service_entry my_service_list[SERVICES_COUNT_MAX];
 
 static int my_service_list_entries = 0;
 
-static const struct memb_ring_id sync_ring_id;
-
 static void (*sync_synchronization_completed) (void);
 
 static void sync_deliver_fn (
@@ -160,6 +141,8 @@ static void sync_deliver_fn (
 static int schedwrk_processor (const void *context);
 
 static void sync_process_enter (void);
+
+static void sync_process_call_init (void);
 
 static struct totempg_group sync_group = {
     .group      = "sync",
@@ -238,21 +221,11 @@ static void sync_barrier_handler (unsigned int nodeid, const void *msg)
 
 		my_processing_idx += 1;
 		if (my_service_list_entries == my_processing_idx) {
-			my_memb_determine_list_entries = 0;
 			sync_synchronization_completed ();
 		} else {
 			sync_process_enter ();
 		}
 	}
-}
-
-static void dummy_sync_init (
-	const unsigned int *trans_list,
-	size_t trans_list_entries,
-	const unsigned int *member_list,
-	size_t member_list_entries,
-	const struct memb_ring_id *ring_id)
-{
 }
 
 static void dummy_sync_abort (void)
@@ -274,31 +247,6 @@ static int service_entry_compare (const void *a, const void *b)
 	const struct service_entry *service_entry_b = b;
 
 	return (service_entry_a->service_id > service_entry_b->service_id);
-}
-
-static void sync_memb_determine (unsigned int nodeid, const void *msg)
-{
-	const struct req_exec_memb_determine_message *req_exec_memb_determine_message = msg;
-	int found = 0;
-	int i;
-
-	if (memcmp (&req_exec_memb_determine_message->ring_id,
-		&my_memb_determine_ring_id, sizeof (struct memb_ring_id)) != 0) {
-
-		log_printf (LOGSYS_LEVEL_DEBUG, "memb determine for old ring - discarding");
-		return;
-	}
-
-	my_memb_determine = 1;
-	for (i = 0; i < my_memb_determine_list_entries; i++) {
-		if (my_memb_determine_list[i] == nodeid) {
-			found = 1;
-		}
-	}
-	if (found == 0) {
-		my_memb_determine_list[my_memb_determine_list_entries] = nodeid;
-		my_memb_determine_list_entries += 1;
-	}
 }
 
 static void sync_service_build_handler (unsigned int nodeid, const void *msg)
@@ -325,15 +273,14 @@ static void sync_service_build_handler (unsigned int nodeid, const void *msg)
 			}
 		}
 		if (found == 0) {
-			my_service_list[my_service_list_entries].state =
-				INIT;
+			my_service_list[my_service_list_entries].state = PROCESS;
 			my_service_list[my_service_list_entries].service_id =
 				req_exec_service_build_message->service_list[i];
 			sprintf (my_service_list[my_service_list_entries].name,
-				"Uknown External Service (id = %d)\n",
+				"Unknown External Service (id = %d)\n",
 				req_exec_service_build_message->service_list[i]);
 			my_service_list[my_service_list_entries].sync_init =
-				dummy_sync_init;
+				NULL;
 			my_service_list[my_service_list_entries].sync_abort =
 				dummy_sync_abort;
 			my_service_list[my_service_list_entries].sync_process =
@@ -360,6 +307,7 @@ static void sync_service_build_handler (unsigned int nodeid, const void *msg)
 		}
 	}
 	if (barrier_reached) {
+		log_printf (LOGSYS_LEVEL_DEBUG, "enter sync process");
 		sync_process_enter ();
 	}
 }
@@ -379,35 +327,15 @@ static void sync_deliver_fn (
 		case MESSAGE_REQ_SYNC_SERVICE_BUILD:
 			sync_service_build_handler (nodeid, msg);
 			break;
-		case MESSAGE_REQ_SYNC_MEMB_DETERMINE:
-			sync_memb_determine (nodeid, msg);
-			break;
 	}
-}
-
-static void memb_determine_message_transmit (void)
-{
-	struct iovec iovec;
-	struct req_exec_memb_determine_message req_exec_memb_determine_message;
-
-	req_exec_memb_determine_message.header.size = sizeof (struct req_exec_memb_determine_message);
-	req_exec_memb_determine_message.header.id = MESSAGE_REQ_SYNC_MEMB_DETERMINE;
-
-	memcpy (&req_exec_memb_determine_message.ring_id,
-		&my_memb_determine_ring_id,
-		sizeof (struct memb_ring_id));
-
-	iovec.iov_base = (char *)&req_exec_memb_determine_message;
-	iovec.iov_len = sizeof (req_exec_memb_determine_message);
-
-	(void)totempg_groups_mcast_joined (sync_group_handle,
-		&iovec, 1, TOTEMPG_AGREED);
 }
 
 static void barrier_message_transmit (void)
 {
 	struct iovec iovec;
 	struct req_exec_barrier_message req_exec_barrier_message;
+
+	memset(&req_exec_barrier_message, 0, sizeof(req_exec_barrier_message));
 
 	req_exec_barrier_message.header.size = sizeof (struct req_exec_barrier_message);
 	req_exec_barrier_message.header.id = MESSAGE_REQ_SYNC_BARRIER;
@@ -445,6 +373,38 @@ static void sync_barrier_enter (void)
 	barrier_message_transmit ();
 }
 
+static void sync_process_call_init (void)
+{
+	unsigned int old_trans_list[PROCESSOR_COUNT_MAX];
+	size_t old_trans_list_entries = 0;
+	int o, m;
+	int i;
+
+	memcpy (old_trans_list, my_trans_list, my_trans_list_entries *
+		sizeof (unsigned int));
+	old_trans_list_entries = my_trans_list_entries;
+
+	my_trans_list_entries = 0;
+	for (o = 0; o < old_trans_list_entries; o++) {
+		for (m = 0; m < my_member_list_entries; m++) {
+			if (old_trans_list[o] == my_member_list[m]) {
+				my_trans_list[my_trans_list_entries] = my_member_list[m];
+				my_trans_list_entries++;
+				break;
+			}
+		}
+	}
+
+	for (i = 0; i < my_service_list_entries; i++) {
+		if (my_sync_callbacks_retrieve(my_service_list[i].service_id, NULL) != -1) {
+			my_service_list[i].sync_init (my_trans_list,
+				my_trans_list_entries, my_member_list,
+				my_member_list_entries,
+				&my_ring_id);
+		}
+	}
+}
+
 static void sync_process_enter (void)
 {
 	int i;
@@ -456,13 +416,13 @@ static void sync_process_enter (void)
 	 */
 	if (my_service_list_entries == 0) {
 		my_state = SYNC_SERVICELIST_BUILD;
-		my_memb_determine_list_entries = 0;
 		sync_synchronization_completed ();
 		return;
 	}
 	for (i = 0; i < my_processor_list_entries; i++) {
 		my_processor_list[i].received = 0;
 	}
+
 	schedwrk_create (&my_schedwrk_handle,
 		schedwrk_processor,
 		NULL);
@@ -477,6 +437,8 @@ static void sync_servicelist_build_enter (
 	int i;
 	int res;
 	struct sync_callbacks sync_callbacks;
+
+	memset(&service_build, 0, sizeof(service_build));
 
 	my_state = SYNC_SERVICELIST_BUILD;
 	for (i = 0; i < member_list_entries; i++) {
@@ -502,8 +464,11 @@ static void sync_servicelist_build_enter (
 		if (sync_callbacks.sync_init == NULL) {
 			continue;
 		}
-		my_service_list[my_service_list_entries].state = INIT;
+		my_service_list[my_service_list_entries].state = PROCESS;
 		my_service_list[my_service_list_entries].service_id = i;
+
+		assert(strlen(sync_callbacks.name) < sizeof(my_service_list[my_service_list_entries].name));
+
 		strcpy (my_service_list[my_service_list_entries].name,
 			sync_callbacks.name);
 		my_service_list[my_service_list_entries].sync_init = sync_callbacks.sync_init;
@@ -520,42 +485,16 @@ static void sync_servicelist_build_enter (
 	service_build.service_list_entries = my_service_list_entries;
 
 	service_build_message_transmit (&service_build);
+
+	log_printf (LOGSYS_LEVEL_DEBUG, "call init for locally known services");
+	sync_process_call_init ();
 }
 
 static int schedwrk_processor (const void *context)
 {
 	int res = 0;
 
-	if (my_service_list[my_processing_idx].state == INIT) {
-		unsigned int old_trans_list[PROCESSOR_COUNT_MAX];
-		size_t old_trans_list_entries = 0;
-		int o, m;
-		my_service_list[my_processing_idx].state = PROCESS;
-
-		memcpy (old_trans_list, my_trans_list, my_trans_list_entries *
-			sizeof (unsigned int));
-		old_trans_list_entries = my_trans_list_entries;
-
-		my_trans_list_entries = 0;
-		for (o = 0; o < old_trans_list_entries; o++) {
-			for (m = 0; m < my_member_list_entries; m++) {
-				if (old_trans_list[o] == my_member_list[m]) {
-					my_trans_list[my_trans_list_entries] = my_member_list[m];
-					my_trans_list_entries++;
-					break;
-				}
-			}
-		}
-
-		if (my_sync_callbacks_retrieve(my_service_list[my_processing_idx].service_id, NULL) != -1) {
-			my_service_list[my_processing_idx].sync_init (my_trans_list,
-				my_trans_list_entries, my_member_list,
-				my_member_list_entries,
-				&my_ring_id);
-		}
-	}
 	if (my_service_list[my_processing_idx].state == PROCESS) {
-		my_service_list[my_processing_idx].state = PROCESS;
 		if (my_sync_callbacks_retrieve(my_service_list[my_processing_idx].service_id, NULL) != -1) {
 			res = my_service_list[my_processing_idx].sync_process ();
 		} else {
@@ -578,14 +517,8 @@ void sync_start (
 	ENTER();
 	memcpy (&my_ring_id, ring_id, sizeof (struct memb_ring_id));
 
-	if (my_memb_determine) {
-		my_memb_determine = 0;
-		sync_servicelist_build_enter (my_memb_determine_list,
-			my_memb_determine_list_entries, ring_id);
-	} else {
-		sync_servicelist_build_enter (member_list, member_list_entries,
-			ring_id);
-	}
+	sync_servicelist_build_enter (member_list, member_list_entries,
+		ring_id);
 }
 
 void sync_save_transitional (
@@ -613,20 +546,4 @@ void sync_abort (void)
 	 * problems.
 	 */
 	memset (&my_ring_id, 0,	sizeof (struct memb_ring_id));
-}
-
-void sync_memb_list_determine (const struct memb_ring_id *ring_id)
-{
-	ENTER();
-	memcpy (&my_memb_determine_ring_id, ring_id,
-		sizeof (struct memb_ring_id));
-
-	memb_determine_message_transmit ();
-}
-
-void sync_memb_list_abort (void)
-{
-	ENTER();
-	my_memb_determine_list_entries = 0;
-	memset (&my_memb_determine_ring_id, 0, sizeof (struct memb_ring_id));
 }

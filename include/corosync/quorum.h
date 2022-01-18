@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2008-2012 Red Hat, Inc.
+ * Copyright (c) 2008-2020 Red Hat, Inc.
  *
  * All rights reserved.
  *
@@ -40,8 +40,24 @@
 extern "C" {
 #endif
 
+typedef enum {
+	QUORUM_MODEL_V0 = 0,
+	QUORUM_MODEL_V1 = 1,
+} quorum_model_t;
+
+/**
+ * @brief quorum_handle_t
+ */
 typedef uint64_t quorum_handle_t;
 
+struct quorum_ring_id {
+	uint32_t nodeid;
+	uint64_t seq;
+};
+
+/**
+ * @brief The quorum_notification_fn_t callback
+ */
 typedef void (*quorum_notification_fn_t) (
 	quorum_handle_t handle,
 	uint32_t quorate,
@@ -50,66 +66,140 @@ typedef void (*quorum_notification_fn_t) (
 	uint32_t *view_list
 	);
 
+typedef void (*quorum_v1_quorum_notification_fn_t) (
+	quorum_handle_t handle,
+	uint32_t quorate,
+	struct quorum_ring_id ring_id,
+	uint32_t member_list_entries, const uint32_t *member_list
+);
+
+typedef void (*quorum_v1_nodelist_notification_fn_t) (
+	quorum_handle_t handle,
+	struct quorum_ring_id ring_id,
+	uint32_t member_list_entries, const uint32_t *member_list,
+	uint32_t joined_list_entries, const uint32_t *joined_list,
+	uint32_t left_list_entries, const uint32_t *left_list
+);
+
+/**
+ * @brief The quorum_callbacks_t struct
+ */
 typedef struct {
 	quorum_notification_fn_t quorum_notify_fn;
 } quorum_callbacks_t;
+
+typedef struct {
+	quorum_model_t model;
+} quorum_model_data_t;
+
+typedef struct {
+	quorum_model_t model;
+	quorum_notification_fn_t quorum_notify_fn;
+} quorum_model_v0_data_t;
+
+typedef struct {
+	quorum_model_t model;
+	quorum_v1_quorum_notification_fn_t quorum_notify_fn;
+	quorum_v1_nodelist_notification_fn_t nodelist_notify_fn;
+} quorum_model_v1_data_t;
 
 #define QUORUM_FREE	0
 #define QUORUM_SET	1
 
 /**
- * Create a new quorum connection
+ * @brief Create a new quorum connection
+ * @param handle
+ * @param callbacks
+ * @param quorum_type
+ * @return
  */
 cs_error_t quorum_initialize (
 	quorum_handle_t *handle,
 	quorum_callbacks_t *callbacks,
 	uint32_t *quorum_type);
 
+cs_error_t quorum_model_initialize (
+	quorum_handle_t *handle,
+	quorum_model_t model,
+	quorum_model_data_t *model_data,
+	uint32_t *quorum_type,
+	void *context);
+
 /**
- * Close the quorum handle
+ * @brief Close the quorum handle
+ * @param handle
+ * @return
  */
 cs_error_t quorum_finalize (
 	quorum_handle_t handle);
 
-
 /**
- * Get a file descriptor on which to poll.
+ * @brief Get a file descriptor on which to poll.
  *
  * @note quorum_handle_t is NOT a file descriptor and may not be used directly.
+ *
+ * @param handle
+ * @param fd
+ * @return
  */
 cs_error_t quorum_fd_get (
 	quorum_handle_t handle,
 	int *fd);
 
 /**
- * Dispatch messages and configuration changes
+ * @brief Dispatch messages and configuration changes
+ * @param handle
+ * @param dispatch_types
+ * @return
  */
 cs_error_t quorum_dispatch (
 	quorum_handle_t handle,
 	cs_dispatch_flags_t dispatch_types);
 
-
 /**
- * Get quorum information.
+ * @brief Get quorum information.
+ * @param handle
+ * @param quorate
+ * @return
  */
 cs_error_t quorum_getquorate (
 	quorum_handle_t handle,
 	int *quorate);
 
 /**
- * Track node and quorum changes
+ * @brief Track node and quorum changes
+ * @param handle
+ * @param flags
+ * @return
  */
 cs_error_t quorum_trackstart (
 	quorum_handle_t handle,
 	unsigned int flags );
 
+/**
+ * @brief quorum_trackstop
+ * @param handle
+ * @return
+ */
 cs_error_t quorum_trackstop (
 	quorum_handle_t handle);
 
+/**
+ * @brief quorum_context_set
+ * @param handle
+ * @param context
+ * @return
+ */
 cs_error_t quorum_context_set (
 	quorum_handle_t handle,
 	const void *context);
 
+/**
+ * @brief quorum_context_get
+ * @param handle
+ * @param context
+ * @return
+ */
 cs_error_t quorum_context_get (
 	quorum_handle_t handle,
 	const void **context);

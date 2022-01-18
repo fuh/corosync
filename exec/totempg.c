@@ -101,17 +101,15 @@
 #include <limits.h>
 
 #include <corosync/swab.h>
-#include <corosync/list.h>
+#include <qb/qblist.h>
 #include <qb/qbloop.h>
 #include <qb/qbipcs.h>
 #include <corosync/totem/totempg.h>
 #define LOGSYS_UTILS_ONLY 1
 #include <corosync/logsys.h>
 
-#include "totemmrp.h"
+#include "util.h"
 #include "totemsrp.h"
-
-#define min(a,b) ((a) < (b)) ? a : b
 
 struct totempg_mcast_header {
 	short version;
@@ -170,6 +168,8 @@ static totem_queue_level_changed_fn totem_queue_level_changed = NULL;
 
 static uint32_t totempg_threaded_mode = 0;
 
+static void *totemsrp_context;
+
 /*
  * Function and data used to log messages
  */
@@ -198,11 +198,11 @@ enum throw_away_mode {
 
 struct assembly {
 	unsigned int nodeid;
-	unsigned char data[MESSAGE_SIZE_MAX];
+	unsigned char data[MESSAGE_SIZE_MAX+KNET_MAX_PACKET_SIZE];
 	int index;
 	unsigned char last_frag_num;
 	enum throw_away_mode throw_away_mode;
-	struct list_head list;
+	struct qb_list_head list;
 };
 
 static void assembly_deref (struct assembly *assembly);
@@ -210,15 +210,16 @@ static void assembly_deref (struct assembly *assembly);
 static int callback_token_received_fn (enum totem_callback_token_type type,
 	const void *data);
 
-DECLARE_LIST_INIT(assembly_list_inuse);
+QB_LIST_DECLARE(assembly_list_inuse);
 
-DECLARE_LIST_INIT(assembly_list_free);
+/*
+ * Free list is used both for transitional and operational assemblies
+ */
+QB_LIST_DECLARE(assembly_list_free);
 
-DECLARE_LIST_INIT(assembly_list_inuse_trans);
+QB_LIST_DECLARE(assembly_list_inuse_trans);
 
-DECLARE_LIST_INIT(assembly_list_free_trans);
-
-DECLARE_LIST_INIT(totempg_groups_list);
+QB_LIST_DECLARE(totempg_groups_list);
 
 /*
  * Staging buffer for packed messages.  Messages are staged in this buffer
@@ -257,7 +258,7 @@ struct totempg_group_instance {
 	int groups_cnt;
 	int32_t q_level;
 
-	struct list_head list;
+	struct qb_list_head list;
 };
 
 static unsigned char next_fragment = 1;
@@ -289,26 +290,20 @@ static void totempg_waiting_trans_ack_cb (int waiting_trans_ack)
 static struct assembly *assembly_ref (unsigned int nodeid)
 {
 	struct assembly *assembly;
-	struct list_head *list;
-	struct list_head *active_assembly_list_inuse;
-	struct list_head *active_assembly_list_free;
+	struct qb_list_head *list;
+	struct qb_list_head *active_assembly_list_inuse;
 
 	if (totempg_waiting_transack) {
 		active_assembly_list_inuse = &assembly_list_inuse_trans;
-		active_assembly_list_free = &assembly_list_free_trans;
 	} else {
 		active_assembly_list_inuse = &assembly_list_inuse;
-		active_assembly_list_free = &assembly_list_free;
 	}
 
 	/*
 	 * Search inuse list for node id and return assembly buffer if found
 	 */
-	for (list = active_assembly_list_inuse->next;
-		list != active_assembly_list_inuse;
-		list = list->next) {
-
-		assembly = list_entry (list, struct assembly, list);
+	qb_list_for_each(list, active_assembly_list_inuse) {
+		assembly = qb_list_entry (list, struct assembly, list);
 
 		if (nodeid == assembly->nodeid) {
 			return (assembly);
@@ -318,10 +313,10 @@ static struct assembly *assembly_ref (unsigned int nodeid)
 	/*
 	 * Nothing found in inuse list get one from free list if available
 	 */
-	if (list_empty (active_assembly_list_free) == 0) {
-		assembly = list_entry (active_assembly_list_free->next, struct assembly, list);
-		list_del (&assembly->list);
-		list_add (&assembly->list, active_assembly_list_inuse);
+	if (qb_list_empty (&assembly_list_free) == 0) {
+		assembly = qb_list_first_entry (&assembly_list_free, struct assembly, list);
+		qb_list_del (&assembly->list);
+		qb_list_add (&assembly->list, active_assembly_list_inuse);
 		assembly->nodeid = nodeid;
 		assembly->index = 0;
 		assembly->last_frag_num = 0;
@@ -342,53 +337,38 @@ static struct assembly *assembly_ref (unsigned int nodeid)
 	assembly->index = 0;
 	assembly->last_frag_num = 0;
 	assembly->throw_away_mode = THROW_AWAY_INACTIVE;
-	list_init (&assembly->list);
-	list_add (&assembly->list, active_assembly_list_inuse);
+	qb_list_init (&assembly->list);
+	qb_list_add (&assembly->list, active_assembly_list_inuse);
 
 	return (assembly);
 }
 
 static void assembly_deref (struct assembly *assembly)
 {
-	struct list_head *active_assembly_list_free;
-
-	if (totempg_waiting_transack) {
-		active_assembly_list_free = &assembly_list_free_trans;
-	} else {
-		active_assembly_list_free = &assembly_list_free;
-	}
-
-	list_del (&assembly->list);
-	list_add (&assembly->list, active_assembly_list_free);
+	qb_list_del (&assembly->list);
+	qb_list_add (&assembly->list, &assembly_list_free);
 }
 
 static void assembly_deref_from_normal_and_trans (int nodeid)
 {
 	int j;
-	struct list_head *list, *list_next;
-	struct list_head *active_assembly_list_inuse;
-	struct list_head *active_assembly_list_free;
+	struct qb_list_head *list, *tmp_iter;
+	struct qb_list_head *active_assembly_list_inuse;
 	struct assembly *assembly;
 
 	for (j = 0; j < 2; j++) {
 		if (j == 0) {
 			active_assembly_list_inuse = &assembly_list_inuse;
-			active_assembly_list_free = &assembly_list_free;
 		} else {
 			active_assembly_list_inuse = &assembly_list_inuse_trans;
-			active_assembly_list_free = &assembly_list_free_trans;
 		}
 
-		for (list = active_assembly_list_inuse->next;
-			list != active_assembly_list_inuse;
-			list = list_next) {
-
-			list_next = list->next;
-			assembly = list_entry (list, struct assembly, list);
+		qb_list_for_each_safe(list, tmp_iter, active_assembly_list_inuse) {
+			assembly = qb_list_entry (list, struct assembly, list);
 
 			if (nodeid == assembly->nodeid) {
-				list_del (&assembly->list);
-				list_add (&assembly->list, active_assembly_list_free);
+				qb_list_del (&assembly->list);
+				qb_list_add (&assembly->list, &assembly_list_free);
 			}
 		}
 	}
@@ -404,7 +384,7 @@ static inline void app_confchg_fn (
 {
 	int i;
 	struct totempg_group_instance *instance;
-	struct list_head *list;
+	struct qb_list_head *list;
 
 	/*
 	 * For every leaving processor, add to free list
@@ -415,11 +395,8 @@ static inline void app_confchg_fn (
 		assembly_deref_from_normal_and_trans (left_list[i]);
 	}
 
-	for (list = totempg_groups_list.next;
-		list != &totempg_groups_list;
-		list = list->next) {
-
-		instance = list_entry (list, struct totempg_group_instance, list);
+	qb_list_for_each(list, &totempg_groups_list) {
+		instance = qb_list_entry (list, struct totempg_group_instance, list);
 
 		if (instance->confchg_fn) {
 			instance->confchg_fn (
@@ -536,7 +513,7 @@ static inline void app_deliver_fn (
 	struct iovec stripped_iovec;
 	unsigned int adjust_iovec;
 	struct iovec *iovec;
-	struct list_head *list;
+	struct qb_list_head *list;
 
         struct iovec aligned_iovec = { NULL, 0 };
 
@@ -564,11 +541,8 @@ static inline void app_deliver_fn (
 
 	iovec = &aligned_iovec;
 
-	for (list = totempg_groups_list.next;
-		list != &totempg_groups_list;
-		list = list->next) {
-
-		instance = list_entry (list, struct totempg_group_instance, list);
+	qb_list_for_each(list, &totempg_groups_list) {
+		instance = qb_list_entry (list, struct totempg_group_instance, list);
 		if (group_matches (iovec, 1, instance->groups, instance->groups_cnt, &adjust_iovec)) {
 			stripped_iovec.iov_len = iovec->iov_len - adjust_iovec;
 			stripped_iovec.iov_base = (char *)iovec->iov_base + adjust_iovec;
@@ -629,9 +603,17 @@ static void totempg_deliver_fn (
 	const char *data;
 	int datasize;
 	struct iovec iov_delv;
+	size_t expected_msg_len;
 
 	assembly = assembly_ref (nodeid);
 	assert (assembly);
+
+	if (msg_len < sizeof(struct totempg_mcast)) {
+		log_printf(LOG_WARNING,
+		    "Message (totempg_mcast) received from node " CS_PRI_NODE_ID " is too short...  Ignoring.", nodeid);
+
+		return ;
+	}
 
 	/*
 	 * Assemble the header into one block of data and
@@ -647,16 +629,37 @@ static void totempg_deliver_fn (
 	datasize = sizeof (struct totempg_mcast) +
 		msg_count * sizeof (unsigned short);
 
+	if (msg_len < datasize) {
+		log_printf(LOG_WARNING,
+		    "Message (totempg_mcast datasize) received from node " CS_PRI_NODE_ID
+		    " is too short...  Ignoring.", nodeid);
+
+		return ;
+	}
+
 	memcpy (header, msg, datasize);
 	data = msg;
 
 	msg_lens = (unsigned short *) (header + sizeof (struct totempg_mcast));
-	if (endian_conversion_required) {
-		for (i = 0; i < mcast->msg_count; i++) {
+	expected_msg_len = datasize;
+	for (i = 0; i < mcast->msg_count; i++) {
+		if (endian_conversion_required) {
 			msg_lens[i] = swab16 (msg_lens[i]);
 		}
+
+		expected_msg_len += msg_lens[i];
 	}
 
+	if (msg_len != expected_msg_len) {
+		log_printf(LOG_WARNING,
+		    "Message (totempg_mcast) received from node " CS_PRI_NODE_ID
+		    " doesn't have expected length of %zu (has %u) bytes...  Ignoring.",
+		    nodeid, expected_msg_len, msg_len);
+
+		return ;
+	}
+
+	assert((assembly->index+msg_len) < sizeof(assembly->data));
 	memcpy (&assembly->data[assembly->index], &data[datasize],
 		msg_len - datasize);
 
@@ -757,7 +760,7 @@ int callback_token_received_fn (enum totem_callback_token_type type,
 		}
 		return (0);
 	}
-	if (totemmrp_avail() == 0) {
+	if (totemsrp_avail(totemsrp_context) == 0) {
 		if (totempg_threaded_mode == 1) {
 			pthread_mutex_unlock (&mcast_msg_mutex);
 		}
@@ -782,7 +785,7 @@ int callback_token_received_fn (enum totem_callback_token_type type,
 	iovecs[1].iov_len = mcast_packed_msg_count * sizeof (unsigned short);
 	iovecs[2].iov_base = (void *)&fragmentation_data[0];
 	iovecs[2].iov_len = fragment_size;
-	(void)totemmrp_mcast (iovecs, 3, 0);
+	(void)totemsrp_mcast (totemsrp_context, iovecs, 3, 0);
 
 	mcast_packed_msg_count = 0;
 	fragment_size = 0;
@@ -818,27 +821,34 @@ int totempg_initialize (
 
 	totemsrp_net_mtu_adjust (totem_config);
 
-	res = totemmrp_initialize (
+	res = totemsrp_initialize (
 		poll_handle,
+		&totemsrp_context,
 		totem_config,
 		&totempg_stats,
 		totempg_deliver_fn,
 		totempg_confchg_fn,
 		totempg_waiting_trans_ack_cb);
 
-	totemmrp_callback_token_create (
+	if (res == -1) {
+		goto error_exit;
+	}
+
+	totemsrp_callback_token_create (
+		totemsrp_context,
 		&callback_token_received_handle,
 		TOTEM_CALLBACK_TOKEN_RECEIVED,
 		0,
 		callback_token_received_fn,
 		0);
 
-	totempg_size_limit = (totemmrp_avail() - 1) *
+	totempg_size_limit = (totemsrp_avail(totemsrp_context) - 1) *
 		(totempg_totem_config->net_mtu -
 		sizeof (struct totempg_mcast) - 16);
 
-	list_init (&totempg_groups_list);
+	qb_list_init (&totempg_groups_list);
 
+error_exit:
 	return (res);
 }
 
@@ -847,7 +857,7 @@ void totempg_finalize (void)
 	if (totempg_threaded_mode == 1) {
 		pthread_mutex_lock (&totempg_mutex);
 	}
-	totemmrp_finalize ();
+	totemsrp_finalize (totemsrp_context);
 	if (totempg_threaded_mode == 1) {
 		pthread_mutex_unlock (&totempg_mutex);
 	}
@@ -875,7 +885,7 @@ static int mcast_msg (
 	if (totempg_threaded_mode == 1) {
 		pthread_mutex_lock (&mcast_msg_mutex);
 	}
-	totemmrp_event_signal (TOTEM_EVENT_NEW_MSG, 1);
+	totemsrp_event_signal (totemsrp_context, TOTEM_EVENT_NEW_MSG, 1);
 
 	/*
 	 * Remove zero length iovectors from the list
@@ -910,6 +920,8 @@ static int mcast_msg (
 		return(-1);
 	}
 
+	memset(&mcast, 0, sizeof(mcast));
+
 	mcast.header.version = 0;
 	for (i = 0; i < iov_len; ) {
 		mcast.fragmented = 0;
@@ -922,7 +934,7 @@ static int mcast_msg (
 		 * fragment_buffer on exit so that max_packet_size + fragment_size
 		 * doesn't exceed the size of the fragment_buffer on the next call.
 		 */
-		if ((copy_len + fragment_size) <
+		if ((iovec[i].iov_len + fragment_size) <
 			(max_packet_size - sizeof (unsigned short))) {
 
 			memcpy (&fragmentation_data[fragment_size],
@@ -946,8 +958,6 @@ static int mcast_msg (
 				data_ptr = (unsigned char *)iovec[i].iov_base + copy_base;
 			else {
 				data_ptr = fragmentation_data;
-				memcpy (&fragmentation_data[fragment_size],
-				(unsigned char *)iovec[i].iov_base + copy_base, copy_len);
 			}
 
 			memcpy (&fragmentation_data[fragment_size],
@@ -982,9 +992,9 @@ static int mcast_msg (
 			iovecs[1].iov_len = mcast_packed_msg_count *
 				sizeof(unsigned short);
 			iovecs[2].iov_base = (void *)data_ptr;
-			iovecs[2].iov_len = max_packet_size;
-			assert (totemmrp_avail() > 0);
-			res = totemmrp_mcast (iovecs, 3, guarantee);
+			iovecs[2].iov_len = fragment_size + copy_len;
+			assert (totemsrp_avail(totemsrp_context) > 0);
+			res = totemsrp_mcast (totemsrp_context, iovecs, 3, guarantee);
 			if (res == -1) {
 				goto error_exit;
 			}
@@ -1038,7 +1048,7 @@ static int msg_count_send_ok (
 {
 	int avail = 0;
 
-	avail = totemmrp_avail ();
+	avail = totemsrp_avail (totemsrp_context);
 	totempg_stats.msg_queue_avail = avail;
 
 	return ((avail - totempg_reserved) > msg_count);
@@ -1050,7 +1060,7 @@ static int byte_count_send_ok (
 	unsigned int msg_count = 0;
 	int avail = 0;
 
-	avail = totemmrp_avail ();
+	avail = totemsrp_avail (totemsrp_context);
 
 	msg_count = (byte_count / (totempg_totem_config->net_mtu - sizeof (struct totempg_mcast) - 16)) + 1;
 
@@ -1083,7 +1093,7 @@ static void send_release (
 
 static uint32_t q_level_precent_used(void)
 {
-	return (100 - (((totemmrp_avail() - totempg_reserved) * 100) / MESSAGE_QUEUE_MAX));
+	return (100 - (((totemsrp_avail(totemsrp_context) - totempg_reserved) * 100) / MESSAGE_QUEUE_MAX));
 }
 
 int totempg_callback_token_create (
@@ -1097,7 +1107,7 @@ int totempg_callback_token_create (
 	if (totempg_threaded_mode == 1) {
 		pthread_mutex_lock (&callback_token_mutex);
 	}
-	res = totemmrp_callback_token_create (handle_out, type, delete,
+	res = totemsrp_callback_token_create (totemsrp_context, handle_out, type, delete,
 		callback_fn, data);
 	if (totempg_threaded_mode == 1) {
 		pthread_mutex_unlock (&callback_token_mutex);
@@ -1111,7 +1121,7 @@ void totempg_callback_token_destroy (
 	if (totempg_threaded_mode == 1) {
 		pthread_mutex_lock (&callback_token_mutex);
 	}
-	totemmrp_callback_token_destroy (handle_out);
+	totemsrp_callback_token_destroy (totemsrp_context, handle_out);
 	if (totempg_threaded_mode == 1) {
 		pthread_mutex_unlock (&callback_token_mutex);
 	}
@@ -1153,8 +1163,8 @@ int totempg_groups_initialize (
 	instance->groups = 0;
 	instance->groups_cnt = 0;
 	instance->q_level = QB_LOOP_MED;
-	list_init (&instance->list);
-	list_add (&instance->list, &totempg_groups_list);
+	qb_list_init (&instance->list);
+	qb_list_add (&instance->list, &totempg_groups_list);
 
 	if (totempg_threaded_mode == 1) {
 		pthread_mutex_unlock (&totempg_mutex);
@@ -1176,7 +1186,7 @@ int totempg_groups_join (
 {
 	struct totempg_group_instance *instance = (struct totempg_group_instance *)totempg_groups_instance;
 	struct totempg_group *new_groups;
-	unsigned int res = 0;
+	int res = 0;
 
 	if (totempg_threaded_mode == 1) {
 		pthread_mutex_lock (&totempg_mutex);
@@ -1186,7 +1196,7 @@ int totempg_groups_join (
 		sizeof (struct totempg_group) *
 		(instance->groups_cnt + group_cnt));
 	if (new_groups == 0) {
-		res = ENOMEM;
+		res = -1;
 		goto error_exit;
 	}
 	memcpy (&new_groups[instance->groups_cnt],
@@ -1421,8 +1431,32 @@ int totempg_groups_send_ok_groups (
 	return (res);
 }
 
+int totempg_iface_set (
+	struct totem_ip_address *interface_addr,
+	unsigned short ip_port,
+	unsigned int iface_no)
+{
+	int res;
+
+	res = totemsrp_iface_set (
+		totemsrp_context,
+		interface_addr,
+		ip_port,
+		iface_no);
+
+	return (res);
+}
+
+int totempg_nodestatus_get (unsigned int nodeid,
+			    struct totem_node_status *node_status)
+{
+	memset(node_status, 0, sizeof(struct totem_node_status));
+	return totemsrp_nodestatus_get (totemsrp_context, nodeid, node_status);
+}
+
 int totempg_ifaces_get (
 	unsigned int nodeid,
+	unsigned int *interface_id,
 	struct totem_ip_address *interfaces,
 	unsigned int interfaces_size,
 	char ***status,
@@ -1430,8 +1464,10 @@ int totempg_ifaces_get (
 {
 	int res;
 
-	res = totemmrp_ifaces_get (
+	res = totemsrp_ifaces_get (
+		totemsrp_context,
 		nodeid,
+		interface_id,
 		interfaces,
 		interfaces_size,
 		status,
@@ -1442,7 +1478,7 @@ int totempg_ifaces_get (
 
 void totempg_event_signal (enum totem_event_type type, int value)
 {
-	totemmrp_event_signal (type, value);
+	totemsrp_event_signal (totemsrp_context, type, value);
 }
 
 void* totempg_get_stats (void)
@@ -1456,16 +1492,7 @@ int totempg_crypto_set (
 {
 	int res;
 
-	res = totemmrp_crypto_set (cipher_type, hash_type);
-
-	return (res);
-}
-
-int totempg_ring_reenable (void)
-{
-	int res;
-
-	res = totemmrp_ring_reenable ();
+	res = totemsrp_crypto_set (totemsrp_context, cipher_type, hash_type);
 
 	return (res);
 }
@@ -1476,21 +1503,24 @@ const char *totempg_ifaces_print (unsigned int nodeid)
 	static char iface_string[256 * INTERFACE_MAX];
 	char one_iface[ONE_IFACE_LEN+1];
 	struct totem_ip_address interfaces[INTERFACE_MAX];
-	char **status;
 	unsigned int iface_count;
+	unsigned int iface_ids[INTERFACE_MAX];
 	unsigned int i;
 	int res;
 
 	iface_string[0] = '\0';
 
-	res = totempg_ifaces_get (nodeid, interfaces, INTERFACE_MAX, &status, &iface_count);
+	res = totempg_ifaces_get (nodeid, iface_ids, interfaces, INTERFACE_MAX, NULL, &iface_count);
 	if (res == -1) {
 		return ("no interface found for nodeid");
 	}
 
-	res = totempg_ifaces_get (nodeid, interfaces, INTERFACE_MAX, &status, &iface_count);
+	res = totempg_ifaces_get (nodeid, iface_ids, interfaces, INTERFACE_MAX, NULL, &iface_count);
 
 	for (i = 0; i < iface_count; i++) {
+		if (!interfaces[i].family) {
+			continue;
+		}
 		snprintf (one_iface, ONE_IFACE_LEN,
 			  "r(%d) ip(%s) ",
 			  i, totemip_print (&interfaces[i]));
@@ -1501,17 +1531,17 @@ const char *totempg_ifaces_print (unsigned int nodeid)
 
 unsigned int totempg_my_nodeid_get (void)
 {
-	return (totemmrp_my_nodeid_get());
+	return (totemsrp_my_nodeid_get(totemsrp_context));
 }
 
 int totempg_my_family_get (void)
 {
-	return (totemmrp_my_family_get());
+	return (totemsrp_my_family_get(totemsrp_context));
 }
 extern void totempg_service_ready_register (
 	void (*totem_service_ready) (void))
 {
-	totemmrp_service_ready_register (totem_service_ready);
+	totemsrp_service_ready_register (totemsrp_context, totem_service_ready);
 }
 
 void totempg_queue_level_register_callback (totem_queue_level_changed_fn fn)
@@ -1523,24 +1553,68 @@ extern int totempg_member_add (
 	const struct totem_ip_address *member,
 	int ring_no)
 {
-	return totemmrp_member_add (member, ring_no);
+	return totemsrp_member_add (totemsrp_context, member, ring_no);
 }
 
 extern int totempg_member_remove (
 	const struct totem_ip_address *member,
 	int ring_no)
 {
-	return totemmrp_member_remove (member, ring_no);
+	return totemsrp_member_remove (totemsrp_context, member, ring_no);
+}
+
+extern int totempg_reconfigure (void)
+{
+	return totemsrp_reconfigure (totemsrp_context, totempg_totem_config);
+}
+
+extern int totempg_crypto_reconfigure_phase (cfg_message_crypto_reconfig_phase_t phase)
+{
+	return totemsrp_crypto_reconfigure_phase (totemsrp_context, totempg_totem_config, phase);
+}
+
+extern void totempg_stats_clear (int flags)
+{
+	if (flags & TOTEMPG_STATS_CLEAR_TOTEM) {
+		totempg_stats.msg_reserved = 0;
+		totempg_stats.msg_queue_avail = 0;
+	}
+	return totemsrp_stats_clear (totemsrp_context, flags);
 }
 
 void totempg_threaded_mode_enable (void)
 {
 	totempg_threaded_mode = 1;
-	totemmrp_threaded_mode_enable ();
+	totemsrp_threaded_mode_enable (totemsrp_context);
 }
 
 void totempg_trans_ack (void)
 {
-	totemmrp_trans_ack ();
+	totemsrp_trans_ack (totemsrp_context);
 }
 
+void totempg_force_gather (void)
+{
+	totemsrp_force_gather(totemsrp_context);
+}
+
+/* Assumes ->orig_interfaces is already allocated */
+void totempg_get_config(struct totem_config *config)
+{
+	struct totem_interface *temp_if = config->orig_interfaces;
+
+	memcpy(config, totempg_totem_config, sizeof(struct totem_config));
+	config->orig_interfaces = temp_if;
+	memcpy(config->orig_interfaces, totempg_totem_config->interfaces, sizeof(struct totem_interface) * INTERFACE_MAX);
+	config->interfaces = NULL;
+}
+
+void totempg_put_config(struct totem_config *config)
+{
+	struct totem_interface *temp_if = totempg_totem_config->interfaces;
+
+	/* Preseve the existing interfaces[] array as transports might have pointers saved */
+	memcpy(totempg_totem_config->interfaces, config->interfaces, sizeof(struct totem_interface) * INTERFACE_MAX);
+	memcpy(totempg_totem_config, config, sizeof(struct totem_config));
+	totempg_totem_config->interfaces = temp_if;
+}

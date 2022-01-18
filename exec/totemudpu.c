@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2005 MontaVista Software, Inc.
- * Copyright (c) 2006-2012 Red Hat, Inc.
+ * Copyright (c) 2006-2018 Red Hat, Inc.
  *
  * All rights reserved.
  *
@@ -58,29 +58,23 @@
 #include <sys/uio.h>
 #include <limits.h>
 
+#include <qb/qblist.h>
 #include <qb/qbdefs.h>
 #include <qb/qbloop.h>
 
 #include <corosync/sq.h>
-#include <corosync/list.h>
 #include <corosync/swab.h>
 #define LOGSYS_UTILS_ONLY 1
 #include <corosync/logsys.h>
 #include "totemudpu.h"
 
 #include "util.h"
-#include "totemcrypto.h"
-
-#include <nss.h>
-#include <pk11pub.h>
-#include <pkcs11.h>
-#include <prerror.h>
 
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
 
-#define MCAST_SOCKET_BUFFER_SIZE (TRANSMITS_ALLOWED * FRAME_SIZE_MAX)
+#define MCAST_SOCKET_BUFFER_SIZE (TRANSMITS_ALLOWED * UDP_RECEIVE_FRAME_SIZE_MAX)
 #define NETIF_STATE_REPORT_UP		1
 #define NETIF_STATE_REPORT_DOWN		2
 
@@ -89,15 +83,13 @@
 #define BIND_STATE_LOOPBACK	2
 
 struct totemudpu_member {
-	struct list_head list;
+	struct qb_list_head list;
 	struct totem_ip_address member;
 	int fd;
 	int active;
 };
 
 struct totemudpu_instance {
-	struct crypto_instance *crypto_inst;
-
 	qb_loop_t *totemudpu_poll_handle;
 
 	struct totem_interface *totem_interface;
@@ -111,11 +103,13 @@ struct totemudpu_instance {
 	void (*totemudpu_deliver_fn) (
 		void *context,
 		const void *msg,
-		unsigned int msg_len);
+		unsigned int msg_len,
+		const struct sockaddr_storage *system_from);
 
 	void (*totemudpu_iface_change_fn) (
 		void *context,
-		const struct totem_ip_address *iface_address);
+		const struct totem_ip_address *iface_address,
+		unsigned int ring_no);
 
 	void (*totemudpu_target_set_completed) (void *context);
 
@@ -145,11 +139,11 @@ struct totemudpu_instance {
 
 	void *udpu_context;
 
-	char iov_buffer[FRAME_SIZE_MAX];
+	char iov_buffer[UDP_RECEIVE_FRAME_SIZE_MAX];
 
 	struct iovec totemudpu_iov_recv;
 
-	struct list_head member_list;
+	struct qb_list_head member_list;
 
 	int stats_sent;
 
@@ -178,6 +172,8 @@ struct totemudpu_instance {
 	struct totem_ip_address token_target;
 
 	int token_socket;
+
+	int local_loop_sock[2];
 
 	qb_loop_timer_handle timer_merge_detect_timeout;
 
@@ -210,8 +206,6 @@ static void totemudpu_start_merge_detect_timeout(
 static void totemudpu_stop_merge_detect_timeout(
 	void *udpu_context);
 
-static struct totem_ip_address localhost;
-
 static void totemudpu_instance_initialize (struct totemudpu_instance *instance)
 {
 	memset (instance, 0, sizeof (struct totemudpu_instance));
@@ -220,14 +214,14 @@ static void totemudpu_instance_initialize (struct totemudpu_instance *instance)
 
 	instance->totemudpu_iov_recv.iov_base = instance->iov_buffer;
 
-	instance->totemudpu_iov_recv.iov_len = FRAME_SIZE_MAX; //sizeof (instance->iov_buffer);
+	instance->totemudpu_iov_recv.iov_len = UDP_RECEIVE_FRAME_SIZE_MAX; //sizeof (instance->iov_buffer);
 
 	/*
 	 * There is always atleast 1 processor
 	 */
 	instance->my_memb_entries = 1;
 
-	list_init (&instance->member_list);
+	qb_list_init (&instance->member_list);
 }
 
 #define log_printf(level, format, args...)		\
@@ -265,27 +259,13 @@ static inline void ucast_sendmsg (
 {
 	struct msghdr msg_ucast;
 	int res = 0;
-	size_t buf_out_len;
-	unsigned char buf_out[FRAME_SIZE_MAX];
 	struct sockaddr_storage sockaddr;
 	struct iovec iovec;
 	int addrlen;
+	int send_sock;
 
-	/*
-	 * Encrypt and digest the message
-	 */
-	if (crypto_encrypt_and_sign (
-		instance->crypto_inst,
-		(const unsigned char *)msg,
-		msg_len,
-		buf_out,
-		&buf_out_len) != 0) {
-		log_printf(LOGSYS_LEVEL_CRIT, "Error encrypting/signing packet (non-critical)");
-		return;
-	}
-
-	iovec.iov_base = (void *)buf_out;
-	iovec.iov_len = buf_out_len;
+	iovec.iov_base = (void *)msg;
+	iovec.iov_len = msg_len;
 
 	/*
 	 * Build unicast message
@@ -313,12 +293,20 @@ static inline void ucast_sendmsg (
 	msg_ucast.msg_accrightslen = 0;
 #endif
 
+	if (instance->netif_bind_state == BIND_STATE_REGULAR) {
+		send_sock = instance->token_socket;
+	} else {
+		send_sock = instance->local_loop_sock[1];
+		msg_ucast.msg_name = NULL;
+		msg_ucast.msg_namelen = 0;
+	}
+
 
 	/*
 	 * Transmit unicast message
 	 * An error here is recovered by totemsrp
 	 */
-	res = sendmsg (instance->token_socket, &msg_ucast, MSG_NOSIGNAL);
+	res = sendmsg (send_sock, &msg_ucast, MSG_NOSIGNAL);
 	if (res < 0) {
 		LOGSYS_PERROR (errno, instance->totemudpu_log_level_debug,
 				"sendmsg(ucast) failed (non-critical)");
@@ -333,53 +321,78 @@ static inline void mcast_sendmsg (
 {
 	struct msghdr msg_mcast;
 	int res = 0;
-	size_t buf_out_len;
-	unsigned char buf_out[FRAME_SIZE_MAX];
 	struct iovec iovec;
 	struct sockaddr_storage sockaddr;
 	int addrlen;
-        struct list_head *list;
+	struct qb_list_head *list;
 	struct totemudpu_member *member;
 
-	/*
-	 * Encrypt and digest the message
-	 */
-	if (crypto_encrypt_and_sign (
-		instance->crypto_inst,
-		(const unsigned char *)msg,
-		msg_len,
-		buf_out,
-		&buf_out_len) != 0) {
-		log_printf(LOGSYS_LEVEL_CRIT, "Error encrypting/signing packet (non-critical)");
-		return;
-	}
-
-	iovec.iov_base = (void *)buf_out;
-	iovec.iov_len = buf_out_len;
+	iovec.iov_base = (void *)msg;
+	iovec.iov_len = msg_len;
 
 	memset(&msg_mcast, 0, sizeof(msg_mcast));
 	/*
 	 * Build multicast message
 	 */
-        for (list = instance->member_list.next;
-		list != &instance->member_list;
-		list = list->next) {
+	if (instance->netif_bind_state == BIND_STATE_REGULAR) {
+		qb_list_for_each(list, &(instance->member_list)) {
+			member = qb_list_entry (list,
+				struct totemudpu_member,
+				list);
+				/*
+				 * Do not send multicast message if message is not "flush", member
+				 * is inactive and timeout for sending merge message didn't expired.
+				 */
+				if (only_active && !member->active && !instance->send_merge_detect_message)
+					continue ;
 
-                member = list_entry (list,
-			struct totemudpu_member,
-			list);
+				totemip_totemip_to_sockaddr_convert(&member->member,
+					instance->totem_interface->ip_port, &sockaddr, &addrlen);
+				msg_mcast.msg_name = &sockaddr;
+				msg_mcast.msg_namelen = addrlen;
+				msg_mcast.msg_iov = (void *)&iovec;
+				msg_mcast.msg_iovlen = 1;
+			#ifdef HAVE_MSGHDR_CONTROL
+				msg_mcast.msg_control = 0;
+			#endif
+			#ifdef HAVE_MSGHDR_CONTROLLEN
+				msg_mcast.msg_controllen = 0;
+			#endif
+			#ifdef HAVE_MSGHDR_FLAGS
+				msg_mcast.msg_flags = 0;
+			#endif
+			#ifdef HAVE_MSGHDR_ACCRIGHTS
+				msg_mcast.msg_accrights = NULL;
+			#endif
+			#ifdef HAVE_MSGHDR_ACCRIGHTSLEN
+				msg_mcast.msg_accrightslen = 0;
+			#endif
 
+				/*
+				 * Transmit multicast message
+				 * An error here is recovered by totemsrp
+				 */
+				res = sendmsg (member->fd, &msg_mcast, MSG_NOSIGNAL);
+				if (res < 0) {
+					LOGSYS_PERROR (errno, instance->totemudpu_log_level_debug,
+						"sendmsg(mcast) failed (non-critical)");
+				}
+		}
+
+		if (!only_active || instance->send_merge_detect_message) {
+			/*
+			 * Current message was sent to all nodes
+			 */
+			instance->merge_detect_messages_sent_before_timeout++;
+			instance->send_merge_detect_message = 0;
+		}
+	} else {
 		/*
-		 * Do not send multicast message if message is not "flush", member
-		 * is inactive and timeout for sending merge message didn't expired.
+		 * Transmit multicast message to local unix mcast loop
+		 * An error here is recovered by totemsrp
 		 */
-		if (only_active && !member->active && !instance->send_merge_detect_message)
-			continue ;
-
-		totemip_totemip_to_sockaddr_convert(&member->member,
-			instance->totem_interface->ip_port, &sockaddr, &addrlen);
-		msg_mcast.msg_name = &sockaddr;
-		msg_mcast.msg_namelen = addrlen;
+		msg_mcast.msg_name = NULL;
+		msg_mcast.msg_namelen = 0;
 		msg_mcast.msg_iov = (void *)&iovec;
 		msg_mcast.msg_iovlen = 1;
 	#ifdef HAVE_MSGHDR_CONTROL
@@ -398,23 +411,12 @@ static inline void mcast_sendmsg (
 		msg_mcast.msg_accrightslen = 0;
 	#endif
 
-		/*
-		 * Transmit multicast message
-		 * An error here is recovered by totemsrp
-		 */
-		res = sendmsg (member->fd, &msg_mcast, MSG_NOSIGNAL);
+		res = sendmsg (instance->local_loop_sock[1], &msg_mcast,
+			MSG_NOSIGNAL);
 		if (res < 0) {
 			LOGSYS_PERROR (errno, instance->totemudpu_log_level_debug,
-				"sendmsg(mcast) failed (non-critical)");
+				"sendmsg(local mcast loop) failed (non-critical)");
 		}
-	}
-
-	if (!only_active || instance->send_merge_detect_message) {
-		/*
-		 * Current message was sent to all nodes
-		 */
-		instance->merge_detect_messages_sent_before_timeout++;
-		instance->send_merge_detect_message = 0;
 	}
 }
 
@@ -430,10 +432,43 @@ int totemudpu_finalize (
 		close (instance->token_socket);
 	}
 
+	if (instance->local_loop_sock[0] > 0) {
+		qb_loop_poll_del (instance->totemudpu_poll_handle,
+			instance->local_loop_sock[0]);
+		close (instance->local_loop_sock[0]);
+		close (instance->local_loop_sock[1]);
+	}
+
 	totemudpu_stop_merge_detect_timeout(instance);
 
 	return (res);
 }
+
+static struct totemudpu_member *find_member_by_sockaddr(
+	const void *udpu_context,
+	const struct sockaddr *sa)
+{
+	struct qb_list_head *list;
+	struct totemudpu_member *member;
+	struct totemudpu_member *res_member;
+	const struct totemudpu_instance *instance = (const struct totemudpu_instance *)udpu_context;
+
+	res_member = NULL;
+
+	qb_list_for_each(list, &(instance->member_list)) {
+		member = qb_list_entry (list,
+			struct totemudpu_member,
+			list);
+
+		if (totemip_sa_equal(&member->member, sa)) {
+			res_member = member;
+			break ;
+		}
+	}
+
+	return (res_member);
+}
+
 
 static int net_deliver_fn (
 	int fd,
@@ -445,7 +480,7 @@ static int net_deliver_fn (
 	struct iovec *iovec;
 	struct sockaddr_storage system_from;
 	int bytes_received;
-	int res = 0;
+	int truncated_packet;
 
 	iovec = &instance->totemudpu_iov_recv;
 
@@ -479,18 +514,40 @@ static int net_deliver_fn (
 		instance->stats_recv += bytes_received;
 	}
 
-	/*
-	 * Authenticate and if authenticated, decrypt datagram
-	 */
+	truncated_packet = 0;
 
-	res = crypto_authenticate_and_decrypt (instance->crypto_inst, iovec->iov_base, &bytes_received);
-	if (res == -1) {
-		log_printf (instance->totemudpu_log_level_security, "Received message has invalid digest... ignoring.");
-		log_printf (instance->totemudpu_log_level_security,
-			"Invalid packet data");
-		iovec->iov_len = FRAME_SIZE_MAX;
-		return 0;
+#ifdef HAVE_MSGHDR_FLAGS
+	if (msg_recv.msg_flags & MSG_TRUNC) {
+		truncated_packet = 1;
 	}
+#else
+	/*
+	 * We don't have MSGHDR_FLAGS, but we can (hopefully) safely make assumption that
+	 * if bytes_received == UDP_RECEIVE_FRAME_SIZE_MAX then packet is truncated
+	 */
+	if (bytes_received == UDP_RECEIVE_FRAME_SIZE_MAX) {
+		truncated_packet = 1;
+	}
+#endif
+
+	if (truncated_packet) {
+		log_printf (instance->totemudpu_log_level_error,
+				"Received too big message. This may be because something bad is happening"
+				"on the network (attack?), or you tried join more nodes than corosync is"
+				"compiled with (%u) or bug in the code (bad estimation of "
+				"the UDP_RECEIVE_FRAME_SIZE_MAX). Dropping packet.", PROCESSOR_COUNT_MAX);
+		return (0);
+	}
+
+	if (instance->totem_config->block_unlisted_ips &&
+	    instance->netif_bind_state == BIND_STATE_REGULAR &&
+	    find_member_by_sockaddr(instance, (const struct sockaddr *)&system_from) == NULL) {
+		log_printf(instance->totemudpu_log_level_debug, "Packet rejected from %s",
+		    totemip_sa_print((const struct sockaddr *)&system_from));
+
+		return (0);
+	}
+
 	iovec->iov_len = bytes_received;
 
 	/*
@@ -499,9 +556,10 @@ static int net_deliver_fn (
 	instance->totemudpu_deliver_fn (
 		instance->context,
 		iovec->iov_base,
-		iovec->iov_len);
+		iovec->iov_len,
+		&system_from);
 
-	iovec->iov_len = FRAME_SIZE_MAX;
+	iovec->iov_len = UDP_RECEIVE_FRAME_SIZE_MAX;
 	return (0);
 }
 
@@ -533,7 +591,6 @@ static void timer_function_netif_check_timeout (
 	struct totemudpu_instance *instance = (struct totemudpu_instance *)data;
 	int interface_up;
 	int interface_num;
-	struct totem_ip_address *bind_address;
 
 	/*
 	 * Build sockets for every interface
@@ -570,14 +627,21 @@ static void timer_function_netif_check_timeout (
 		qb_loop_poll_del (instance->totemudpu_poll_handle,
 			instance->token_socket);
 		close (instance->token_socket);
+		instance->token_socket = -1;
 	}
 
 	if (interface_up == 0) {
+		if (instance->netif_bind_state == BIND_STATE_UNBOUND) {
+			log_printf (instance->totemudpu_log_level_error,
+				"One of your ip addresses are now bound to localhost. "
+				"Corosync would not work correctly.");
+			exit(COROSYNC_DONE_FATAL_ERR);
+		}
+
 		/*
 		 * Interface is not up
 		 */
 		instance->netif_bind_state = BIND_STATE_LOOPBACK;
-		bind_address = &localhost;
 
 		/*
 		 * Add a timer to retry building interfaces and request memb_gather_enter
@@ -593,19 +657,20 @@ static void timer_function_netif_check_timeout (
 		 * Interface is up
 		 */
 		instance->netif_bind_state = BIND_STATE_REGULAR;
-		bind_address = &instance->totem_interface->bindnet;
 	}
 	/*
 	 * Create and bind the multicast and unicast sockets
 	 */
 	totemudpu_build_sockets (instance,
-		bind_address,
+		&instance->totem_interface->bindnet,
 		&instance->totem_interface->boundto);
 
-	qb_loop_poll_add (instance->totemudpu_poll_handle,
-		QB_LOOP_MED,
-		instance->token_socket,
-		POLLIN, instance, net_deliver_fn);
+	if (instance->netif_bind_state == BIND_STATE_REGULAR) {
+		qb_loop_poll_add (instance->totemudpu_poll_handle,
+			QB_LOOP_MED,
+			instance->token_socket,
+			POLLIN, instance, net_deliver_fn);
+	}
 
 	totemip_copy (&instance->my_id, &instance->totem_interface->boundto);
 
@@ -618,7 +683,7 @@ static void timer_function_netif_check_timeout (
 				"The network interface [%s] is now up.",
 				totemip_print (&instance->totem_interface->boundto));
 			instance->netif_state_report = NETIF_STATE_REPORT_DOWN;
-			instance->totemudpu_iface_change_fn (instance->context, &instance->my_id);
+			instance->totemudpu_iface_change_fn (instance->context, &instance->my_id, 0);
 		}
 		/*
 		 * Add a timer to check for interface going down in single membership
@@ -636,7 +701,7 @@ static void timer_function_netif_check_timeout (
 		if (instance->netif_state_report & NETIF_STATE_REPORT_DOWN) {
 			log_printf (instance->totemudpu_log_level_notice,
 				"The network interface is down.");
-			instance->totemudpu_iface_change_fn (instance->context, &instance->my_id);
+			instance->totemudpu_iface_change_fn (instance->context, &instance->my_id, 0);
 		}
 		instance->netif_state_report = NETIF_STATE_REPORT_UP;
 
@@ -668,6 +733,7 @@ static int totemudpu_build_sockets_ip (
 	int res;
 	unsigned int recvbuf_size;
 	unsigned int optlen = sizeof (recvbuf_size);
+	unsigned int retries = 0;
 
 	/*
 	 * Setup unicast socket
@@ -692,10 +758,24 @@ static int totemudpu_build_sockets_ip (
 	 * This has the side effect of binding to the correct interface
 	 */
 	totemip_totemip_to_sockaddr_convert(bound_to, instance->totem_interface->ip_port, &sockaddr, &addrlen);
-	res = bind (instance->token_socket, (struct sockaddr *)&sockaddr, addrlen);
-	if (res == -1) {
+	while (1) {
+		res = bind (instance->token_socket, (struct sockaddr *)&sockaddr, addrlen);
+		if (res == 0) {
+			break;
+		}
 		LOGSYS_PERROR (errno, instance->totemudpu_log_level_warning,
 			"bind token socket failed");
+		if (++retries > BIND_MAX_RETRIES) {
+			break;
+		}
+
+		/*
+		 * Wait for a while
+		 */
+		(void)poll(NULL, 0, BIND_RETRIES_INTERVAL * retries);
+	}
+
+	if (res == -1) {
 		return (-1);
 	}
 
@@ -712,6 +792,109 @@ static int totemudpu_build_sockets_ip (
 	}
 
 	return 0;
+}
+
+int totemudpu_nodestatus_get (void *udpu_context, unsigned int nodeid,
+			      struct totem_node_status *node_status)
+{
+	struct totemudpu_instance *instance = (struct totemudpu_instance *)udpu_context;
+	struct qb_list_head *list;
+	struct totemudpu_member *member;
+
+	qb_list_for_each(list, &(instance->member_list)) {
+		member = qb_list_entry (list,
+			struct totemudpu_member,
+			list);
+
+		if (member->member.nodeid == nodeid) {
+			node_status->nodeid = nodeid;
+			/* reachable is filled in by totemsrp */
+			if (instance->netif_bind_state == BIND_STATE_REGULAR) {
+				node_status->link_status[0].enabled = 1;
+			} else {
+				node_status->link_status[0].enabled = 0;
+			}
+			node_status->link_status[0].connected = node_status->reachable;
+			node_status->link_status[0].mtu = instance->totem_config->net_mtu;
+			strncpy(node_status->link_status[0].src_ipaddr, totemip_print(&member->member), KNET_MAX_HOST_LEN-1);
+		}
+	}
+	return (0);
+}
+
+int totemudpu_ifaces_get (
+	void *net_context,
+	char ***status,
+	unsigned int *iface_count)
+{
+	static char *statuses[INTERFACE_MAX] = {(char*)"OK"};
+
+	if (status) {
+		*status = statuses;
+	}
+	*iface_count = 1;
+
+	return (0);
+}
+
+
+static int totemudpu_build_local_sockets(
+	struct totemudpu_instance *instance)
+{
+	int i;
+	unsigned int sendbuf_size;
+	unsigned int recvbuf_size;
+	unsigned int optlen = sizeof (sendbuf_size);
+	int res;
+
+	/*
+	 * Create local multicast loop socket
+	 */
+	if (socketpair(AF_UNIX, SOCK_DGRAM, 0, instance->local_loop_sock) == -1) {
+		LOGSYS_PERROR (errno, instance->totemudpu_log_level_warning,
+			"socket() failed");
+		return (-1);
+	}
+
+	for (i = 0; i < 2; i++) {
+		totemip_nosigpipe (instance->local_loop_sock[i]);
+		res = fcntl (instance->local_loop_sock[i], F_SETFL, O_NONBLOCK);
+		if (res == -1) {
+			LOGSYS_PERROR (errno, instance->totemudpu_log_level_warning,
+				"Could not set non-blocking operation on multicast socket");
+			return (-1);
+		}
+	}
+
+	recvbuf_size = MCAST_SOCKET_BUFFER_SIZE;
+	sendbuf_size = MCAST_SOCKET_BUFFER_SIZE;
+
+	res = setsockopt (instance->local_loop_sock[0], SOL_SOCKET, SO_RCVBUF, &recvbuf_size, optlen);
+	if (res == -1) {
+		LOGSYS_PERROR (errno, instance->totemudpu_log_level_debug,
+			"Unable to set SO_RCVBUF size on UDP local mcast loop socket");
+		return (-1);
+	}
+	res = setsockopt (instance->local_loop_sock[1], SOL_SOCKET, SO_SNDBUF, &sendbuf_size, optlen);
+	if (res == -1) {
+		LOGSYS_PERROR (errno, instance->totemudpu_log_level_debug,
+			"Unable to set SO_SNDBUF size on UDP local mcast loop socket");
+		return (-1);
+	}
+
+	res = getsockopt (instance->local_loop_sock[0], SOL_SOCKET, SO_RCVBUF, &recvbuf_size, &optlen);
+	if (res == 0) {
+		log_printf (instance->totemudpu_log_level_debug,
+			"Local receive multicast loop socket recv buffer size (%d bytes).", recvbuf_size);
+	}
+
+	res = getsockopt (instance->local_loop_sock[1], SOL_SOCKET, SO_SNDBUF, &sendbuf_size, &optlen);
+	if (res == 0) {
+		log_printf (instance->totemudpu_log_level_debug,
+			"Local transmit multicast loop socket send buffer size (%d bytes).", sendbuf_size);
+	}
+
+	return (0);
 }
 
 static int totemudpu_build_sockets (
@@ -741,6 +924,13 @@ static int totemudpu_build_sockets (
 	res = totemudpu_build_sockets_ip (instance,
 		bindnet_address, bound_to, interface_num);
 
+	if (res == -1) {
+		/* if we get here, corosync won't work anyway, so better leaving than faking to work */
+		LOGSYS_PERROR (errno, instance->totemudpu_log_level_error,
+					"Unable to create sockets, exiting");
+		exit(EXIT_FAILURE);
+	}
+
 	/* We only send out of the token socket */
 	totemudpu_traffic_control_set(instance, instance->token_socket);
 
@@ -753,7 +943,7 @@ static int totemudpu_build_sockets (
 }
 
 /*
- * Totem Network interface - also does encryption/decryption
+ * Totem Network interface
  * depends on poll abstraction, POSIX, IPV4
  */
 
@@ -765,17 +955,22 @@ int totemudpu_initialize (
 	void **udpu_context,
 	struct totem_config *totem_config,
 	totemsrp_stats_t *stats,
-	int interface_no,
 	void *context,
 
 	void (*deliver_fn) (
 		void *context,
 		const void *msg,
-		unsigned int msg_len),
+		unsigned int msg_len,
+		const struct sockaddr_storage *system_from),
 
 	void (*iface_change_fn) (
 		void *context,
-		const struct totem_ip_address *iface_address),
+		const struct totem_ip_address *iface_address,
+		unsigned int ring_no),
+
+	void (*mtu_changed) (
+		void *context,
+		int net_mtu),
 
 	void (*target_set_completed) (
 		void *context))
@@ -804,26 +999,10 @@ int totemudpu_initialize (
 	instance->totemudpu_log_printf = totem_config->totem_logging_configuration.log_printf;
 
 	/*
-	* Initialize random number generator for later use to generate salt
-	*/
-	instance->crypto_inst = crypto_init (totem_config->private_key,
-		totem_config->private_key_len,
-		totem_config->crypto_cipher_type,
-		totem_config->crypto_hash_type,
-		instance->totemudpu_log_printf,
-		instance->totemudpu_log_level_security,
-		instance->totemudpu_log_level_notice,
-		instance->totemudpu_log_level_error,
-		instance->totemudpu_subsys_id);
-	if (instance->crypto_inst == NULL) {
-		free(instance);
-		return (-1);
-	}
-	/*
 	 * Initialize local variables for totemudpu
 	 */
-	instance->totem_interface = &totem_config->interfaces[interface_no];
-	memset (instance->iov_buffer, 0, FRAME_SIZE_MAX);
+	instance->totem_interface = &totem_config->interfaces[0];
+	memset (instance->iov_buffer, 0, UDP_RECEIVE_FRAME_SIZE_MAX);
 
 	instance->totemudpu_poll_handle = poll_handle;
 
@@ -836,8 +1015,19 @@ int totemudpu_initialize (
 
 	instance->totemudpu_target_set_completed = target_set_completed;
 
-        totemip_localhost (AF_INET, &localhost);
-	localhost.nodeid = instance->totem_config->node_id;
+	/*
+	 * Create static local mcast sockets
+	 */
+	if (totemudpu_build_local_sockets(instance) == -1) {
+		free(instance);
+		return (-1);
+	}
+
+	qb_loop_poll_add (
+		instance->totemudpu_poll_handle,
+		QB_LOOP_MED,
+		instance->local_loop_sock[0],
+		POLLIN, instance, net_deliver_fn);
 
 	/*
 	 * RRP layer isn't ready to receive message because it hasn't
@@ -850,7 +1040,7 @@ int totemudpu_initialize (
 		timer_function_netif_check_timeout,
 		&instance->timer_netif_check_timeout);
 
-	totemudpu_start_merge_detect_timeout(instance);
+	totemudpu_start_merge_detect_timeout((void*)instance);
 
 	*udpu_context = instance;
 	return (0);
@@ -952,47 +1142,33 @@ extern int totemudpu_iface_check (void *udpu_context)
 
 extern void totemudpu_net_mtu_adjust (void *udpu_context, struct totem_config *totem_config)
 {
-
-	assert(totem_config->interface_count > 0);
-
-	totem_config->net_mtu -= crypto_sec_header_size(totem_config->crypto_cipher_type,
-							totem_config->crypto_hash_type) +
-				 totemip_udpip_header_size(totem_config->interfaces[0].bindnet.family);
+	totem_config->net_mtu -= totemip_udpip_header_size(totem_config->interfaces[0].bindnet.family);
 }
 
-const char *totemudpu_iface_print (void *udpu_context)  {
-	struct totemudpu_instance *instance = (struct totemudpu_instance *)udpu_context;
-	const char *ret_char;
-
-	ret_char = totemip_print (&instance->my_id);
-
-	return (ret_char);
-}
-
-int totemudpu_iface_get (
-	void *udpu_context,
-	struct totem_ip_address *addr)
-{
-	struct totemudpu_instance *instance = (struct totemudpu_instance *)udpu_context;
-	int res = 0;
-
-	memcpy (addr, &instance->my_id, sizeof (struct totem_ip_address));
-
-	return (res);
-}
 
 int totemudpu_token_target_set (
 	void *udpu_context,
-	const struct totem_ip_address *token_target)
+	unsigned int nodeid)
 {
+
 	struct totemudpu_instance *instance = (struct totemudpu_instance *)udpu_context;
+	struct qb_list_head *list;
+	struct totemudpu_member *member;
 	int res = 0;
 
-	memcpy (&instance->token_target, token_target,
-		sizeof (struct totem_ip_address));
+	qb_list_for_each(list, &(instance->member_list)) {
+		member = qb_list_entry (list,
+			struct totemudpu_member,
+			list);
 
-	instance->totemudpu_target_set_completed (instance->context);
+		if (member->member.nodeid == nodeid) {
+			memcpy (&instance->token_target, &member->member,
+				sizeof (struct totem_ip_address));
 
+			instance->totemudpu_target_set_completed (instance->context);
+			break;
+		}
+	}
 	return (res);
 }
 
@@ -1004,8 +1180,9 @@ extern int totemudpu_recv_mcast_empty (
 	struct sockaddr_storage system_from;
 	struct msghdr msg_recv;
 	struct pollfd ufd;
-	int nfds;
+	int nfds, i;
 	int msg_processed = 0;
+	int sock;
 
 	/*
 	 * Receive datagram
@@ -1030,19 +1207,34 @@ extern int totemudpu_recv_mcast_empty (
 	msg_recv.msg_accrightslen = 0;
 #endif
 
-	do {
-		ufd.fd = instance->token_socket;
-		ufd.events = POLLIN;
-		nfds = poll (&ufd, 1, 0);
-		if (nfds == 1 && ufd.revents & POLLIN) {
-			res = recvmsg (instance->token_socket, &msg_recv, MSG_NOSIGNAL | MSG_DONTWAIT);
-			if (res != -1) {
-				msg_processed = 1;
+	for (i = 0; i < 2; i++) {
+		sock = -1;
+		if (i == 0) {
+			if (instance->netif_bind_state == BIND_STATE_REGULAR) {
+				sock = instance->token_socket;
 			} else {
-				msg_processed = -1;
+				continue;
 			}
 		}
-	} while (nfds == 1);
+		if (i == 1) {
+			sock = instance->local_loop_sock[0];
+		}
+		assert(sock != -1);
+
+		do {
+			ufd.fd = sock;
+			ufd.events = POLLIN;
+			nfds = poll (&ufd, 1, 0);
+			if (nfds == 1 && ufd.revents & POLLIN) {
+				res = recvmsg (sock, &msg_recv, MSG_NOSIGNAL | MSG_DONTWAIT);
+				if (res != -1) {
+					msg_processed = 1;
+				} else {
+					msg_processed = -1;
+				}
+			}
+		} while (nfds == 1);
+	}
 
 	return (msg_processed);
 }
@@ -1106,9 +1298,20 @@ error_close_fd:
 	return (-1);
 }
 
+int totemudpu_iface_set (void *net_context,
+	const struct totem_ip_address *local_addr,
+	unsigned short ip_port,
+	unsigned int iface_no)
+{
+	/* Not supported */
+	return (-1);
+}
+
 int totemudpu_member_add (
 	void *udpu_context,
-	const struct totem_ip_address *member)
+	const struct totem_ip_address *local,
+	const struct totem_ip_address *member,
+	int ring_no)
 {
 	struct totemudpu_instance *instance = (struct totemudpu_instance *)udpu_context;
 
@@ -1123,21 +1326,22 @@ int totemudpu_member_add (
 
 	log_printf (LOGSYS_LEVEL_NOTICE, "adding new UDPU member {%s}",
 		totemip_print(member));
-	list_init (&new_member->list);
-	list_add_tail (&new_member->list, &instance->member_list);
+	qb_list_init (&new_member->list);
+	qb_list_add_tail (&new_member->list, &instance->member_list);
 	memcpy (&new_member->member, member, sizeof (struct totem_ip_address));
 	new_member->fd = totemudpu_create_sending_socket(udpu_context, member);
-	new_member->active = 0;
+	new_member->active = 1;
 
 	return (0);
 }
 
 int totemudpu_member_remove (
 	void *udpu_context,
-	const struct totem_ip_address *token_target)
+	const struct totem_ip_address *token_target,
+	int ring_no)
 {
 	int found = 0;
-	struct list_head *list;
+	struct qb_list_head *list;
 	struct totemudpu_member *member;
 
 	struct totemudpu_instance *instance = (struct totemudpu_instance *)udpu_context;
@@ -1145,11 +1349,8 @@ int totemudpu_member_remove (
 	/*
 	 * Find the member to remove and close its socket
 	 */
-	for (list = instance->member_list.next;
-		list != &instance->member_list;
-		list = list->next) {
-
-		member = list_entry (list,
+	qb_list_for_each(list, &(instance->member_list)) {
+		member = qb_list_entry (list,
 			struct totemudpu_member,
 			list);
 
@@ -1175,7 +1376,7 @@ int totemudpu_member_remove (
 	 * Delete the member from the list
 	 */
 	if (found) {
-		list_del (list);
+		qb_list_del (list);
 	}
 
 	instance = NULL;
@@ -1185,16 +1386,13 @@ int totemudpu_member_remove (
 int totemudpu_member_list_rebind_ip (
 	void *udpu_context)
 {
-	struct list_head *list;
+	struct qb_list_head *list;
 	struct totemudpu_member *member;
 
 	struct totemudpu_instance *instance = (struct totemudpu_instance *)udpu_context;
 
-	for (list = instance->member_list.next;
-		list != &instance->member_list;
-		list = list->next) {
-
-		member = list_entry (list,
+	qb_list_for_each(list, &(instance->member_list)) {
+		member = qb_list_entry (list,
 			struct totemudpu_member,
 			list);
 
@@ -1208,45 +1406,6 @@ int totemudpu_member_list_rebind_ip (
 	return (0);
 }
 
-int totemudpu_member_set_active (
-	void *udpu_context,
-	const struct totem_ip_address *member_ip,
-	int active)
-{
-	struct list_head *list;
-	struct totemudpu_member *member;
-	int addr_found = 0;
-
-	struct totemudpu_instance *instance = (struct totemudpu_instance *)udpu_context;
-
-	/*
-	 * Find the member to set active flag
-	 */
-	for (list = instance->member_list.next; list != &instance->member_list;	list = list->next) {
-		member = list_entry (list, struct totemudpu_member, list);
-
-		if (totemip_compare (member_ip, &member->member) == 0) {
-			log_printf(LOGSYS_LEVEL_DEBUG,
-			    "Marking UDPU member %s %s",
-			    totemip_print(&member->member),
-			    (active ? "active" : "inactive"));
-
-			member->active = active;
-			addr_found = 1;
-
-			break;
-		}
-	}
-
-	if (!addr_found) {
-		log_printf(LOGSYS_LEVEL_DEBUG,
-		    "Can't find UDPU member %s (should be marked as %s)",
-			    totemip_print(member_ip),
-			    (active ? "active" : "inactive"));
-	}
-
-	return (0);
-}
 
 static void timer_function_merge_detect_timeout (
 	void *data)
@@ -1283,4 +1442,12 @@ static void totemudpu_stop_merge_detect_timeout(
 
 	qb_loop_timer_del(instance->totemudpu_poll_handle,
 	    instance->timer_merge_detect_timeout);
+}
+
+int totemudpu_reconfigure (
+	void *udpu_context,
+	struct totem_config *totem_config)
+{
+	/* Not supported */
+	return (-1);
 }

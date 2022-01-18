@@ -1,13 +1,22 @@
 [Unit]
 Description=Corosync Cluster Engine
+Documentation=man:corosync man:corosync.conf man:corosync_overview
 ConditionKernelCommandLine=!nocluster
 Requires=network-online.target
 After=network-online.target
 
 [Service]
-ExecStart=@INITWRAPPERSDIR@/corosync start
-ExecStop=@INITWRAPPERSDIR@/corosync stop
-Type=forking
+EnvironmentFile=-@INITCONFIGDIR@/corosync
+ExecStart=@SBINDIR@/corosync -f $COROSYNC_OPTIONS
+ExecStop=@SBINDIR@/corosync-cfgtool -H --force
+Type=notify
+
+# In typical systemd deployments, both standard outputs are forwarded to
+# journal (stderr is what's relevant in the pristine corosync configuration),
+# which hazards a message redundancy since the syslog stream usually ends there
+# as well; before editing this line, you may want to check DefaultStandardError
+# in systemd-system.conf(5) and whether /dev/log is a systemd related symlink.
+StandardError=null
 
 # The following config is for corosync with enabled watchdog service.
 #
@@ -19,7 +28,7 @@ Type=forking
 #  Specify a period longer than soft_margin as RestartSec.
 #RestartSec=70
 #  rewrite according to environment.
-#ExecStartPre=/sbin/modprobe softdog soft_margin=60
+#ExecStartPre=/sbin/modprobe softdog
 
 [Install]
 WantedBy=multi-user.target

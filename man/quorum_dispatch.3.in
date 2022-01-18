@@ -1,5 +1,5 @@
 .\"/*
-.\" * Copyright (c) 2012 Red Hat, Inc.
+.\" * Copyright (c) 2012-2020 Red Hat, Inc.
 .\" *
 .\" * All rights reserved.
 .\" *
@@ -43,7 +43,7 @@ The
 .B quorum_dispatch
 function is used to dispatch configuration changes.
 .PP
-Each application may have several connections to the quorum API.  Each  application
+Each application may have several connections to the quorum API.  Each application
 uses the
 .I handle
 argument to uniquely identify the connection.
@@ -85,8 +85,9 @@ This call returns the CS_OK value if successful, otherwise an error is returned.
 .SH ERRORS
 @COMMONIPCERRORS@
 .SH "SEE ALSO"
-.BR quorum_overview (8),
+.BR quorum_overview (3),
 .BR quorum_initialize (3),
+.BR quorum_model_initialize (3),
 .BR quorum_finalize (3),
 .BR quorum_getquorate (3),
 .BR quorum_trackstart (3),

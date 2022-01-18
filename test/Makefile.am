@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2009 Red Hat, Inc.
+# Copyright (c) 2009-2020 Red Hat, Inc.
 #
 # Authors: Andrew Beekhof
 #	   Steven Dake (sdake@redhat.com)
@@ -34,10 +34,11 @@ MAINTAINERCLEANFILES	= Makefile.in
 
 EXTRA_DIST		= ploadstart.sh
 
-noinst_PROGRAMS		= cpgverify testcpg testcpg2 cpgbench \
+noinst_PROGRAMS		= testcpg testcpg2 cpgbench \
 			  testquorum testvotequorum1 testvotequorum2	\
 			  stress_cpgfdget stress_cpgcontext cpgbound testsam \
-			  testcpgzc cpgbenchzc testzcgc stress_cpgzc
+			  testcpgzc cpgbenchzc testzcgc stress_cpgzc \
+			  testquorummodel testcfg
 
 noinst_SCRIPTS		= ploadstart
 
@@ -49,17 +50,25 @@ stress_cpgzc_LDADD	= $(LIBQB_LIBS) $(top_builddir)/lib/libcpg.la
 stress_cpgfdget_LDADD	= $(LIBQB_LIBS) $(top_builddir)/lib/libcpg.la
 stress_cpgcontext_LDADD	= $(LIBQB_LIBS) $(top_builddir)/lib/libcpg.la
 testquorum_LDADD	= $(LIBQB_LIBS) $(top_builddir)/lib/libquorum.la
+testquorummodel_LDADD	= $(LIBQB_LIBS) $(top_builddir)/lib/libquorum.la
 testvotequorum1_LDADD	= $(LIBQB_LIBS) $(top_builddir)/lib/libvotequorum.la
 testvotequorum2_LDADD	= $(LIBQB_LIBS) $(top_builddir)/lib/libvotequorum.la
-cpgverify_CPPFLAGS	= $(nss_CFLAGS)
-cpgverify_LDADD		= $(LIBQB_LIBS) $(nss_LIBS) $(top_builddir)/lib/libcpg.la
 cpgbound_LDADD		= $(LIBQB_LIBS) $(top_builddir)/lib/libcpg.la
 cpgbench_LDADD		= $(LIBQB_LIBS) $(top_builddir)/lib/libcpg.la
-cpgbenchzc_LDADD	= $(LIBQB_LIBS) $(top_builddir)/lib/libcpg.la
-testsam_LDADD		= $(LIBQB_LIBS) $(top_builddir)/lib/libsam.la
+cpgbenchzc_LDADD	= $(LIBQB_LIBS) $(top_builddir)/lib/libcpg.la \
+			  $(top_builddir)/common_lib/libcorosync_common.la
+testsam_LDADD		= $(LIBQB_LIBS) $(top_builddir)/lib/libsam.la \
+			  $(top_builddir)/lib/libcmap.la
+testcfg_LDADD		= $(LIBQB_LIBS) $(top_builddir)/lib/libcfg.la
+
+if HAVE_CRC32
+noinst_PROGRAMS	        += cpghum cpgverify
+cpghum_LDADD            = $(LIBQB_LIBS) $(top_builddir)/lib/libcpg.la -lz
+cpgverify_LDADD		= $(LIBQB_LIBS) $(top_builddir)/lib/libcpg.la -lz
+endif
 
 ploadstart: ploadstart.sh
-	sed -e 's#@''BASHPATH@#${BASHPATH}#g' $< > $@
+	$(SED) -e 's#@''BASHPATH@#${BASHPATH}#g' $< > $@
 	chmod 755 $@
 
 LINT_FILES1:=$(filter-out sa_error.c, $(wildcard *.c))

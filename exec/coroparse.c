@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2006-2013 Red Hat, Inc.
+ * Copyright (c) 2006-2019 Red Hat, Inc.
  *
  * All rights reserved.
  *
@@ -49,12 +49,13 @@
 #include <errno.h>
 #include <string.h>
 #include <dirent.h>
+#include <libgen.h>
 #include <limits.h>
 #include <stddef.h>
 #include <grp.h>
 #include <pwd.h>
 
-#include <corosync/list.h>
+#include <qb/qblist.h>
 #include <qb/qbutil.h>
 #define LOGSYS_UTILS_ONLY 1
 #include <corosync/logsys.h>
@@ -71,14 +72,6 @@ enum parser_cb_type {
 	PARSER_CB_ITEM,
 };
 
-typedef int (*parser_cb_f)(const char *path,
-			char *key,
-			char *value,
-			enum parser_cb_type type,
-			const char **error_string,
-			icmap_map_t config_map,
-			void *user_data);
-
 enum main_cp_cb_data_state {
 	MAIN_CP_CB_DATA_STATE_NORMAL,
 	MAIN_CP_CB_DATA_STATE_TOTEM,
@@ -92,32 +85,50 @@ enum main_cp_cb_data_state {
 	MAIN_CP_CB_DATA_STATE_NODELIST,
 	MAIN_CP_CB_DATA_STATE_NODELIST_NODE,
 	MAIN_CP_CB_DATA_STATE_PLOAD,
-	MAIN_CP_CB_DATA_STATE_QB
+	MAIN_CP_CB_DATA_STATE_SYSTEM,
+	MAIN_CP_CB_DATA_STATE_RESOURCES,
+	MAIN_CP_CB_DATA_STATE_RESOURCES_SYSTEM,
+	MAIN_CP_CB_DATA_STATE_RESOURCES_PROCESS,
+	MAIN_CP_CB_DATA_STATE_RESOURCES_SYSTEM_MEMUSED,
+	MAIN_CP_CB_DATA_STATE_RESOURCES_PROCESS_MEMUSED
 };
+
+typedef int (*parser_cb_f)(const char *path,
+			char *key,
+			char *value,
+			enum main_cp_cb_data_state *state,
+			enum parser_cb_type type,
+			const char **error_string,
+			icmap_map_t config_map,
+			void *user_data);
 
 struct key_value_list_item {
 	char *key;
 	char *value;
-	struct list_head list;
+	struct qb_list_head list;
 };
 
 struct main_cp_cb_data {
-	enum main_cp_cb_data_state state;
-
-	int ringnumber;
+	int linknumber;
 	char *bindnetaddr;
 	char *mcastaddr;
 	char *broadcast;
 	int mcastport;
 	int ttl;
+	int knet_link_priority;
+	int knet_ping_interval;
+	int knet_ping_timeout;
+	int knet_ping_precision;
+	int knet_pong_count;
+	int knet_pmtud_interval;
+	char *knet_transport;
 
-	struct list_head logger_subsys_items_head;
+	struct qb_list_head logger_subsys_items_head;
 	char *subsys;
 	char *logging_daemon_name;
-	struct list_head member_items_head;
+	struct qb_list_head member_items_head;
 
 	int node_number;
-	int ring0_addr_added;
 };
 
 static int read_config_file_into_icmap(
@@ -136,7 +147,7 @@ static int uid_determine (const char *req_user)
 	char *ep;
 
 	id = strtol(req_user, &ep, 10);
-	if (*ep == '\0' && id >= 0 && id <= UINT_MAX) {
+	if (*req_user != '\0' && *ep == '\0' && id >= 0 && id <= UINT_MAX) {
 		return (id);
 	}
 
@@ -190,7 +201,7 @@ static int gid_determine (const char *req_group)
 	char *ep;
 
 	id = strtol(req_group, &ep, 10);
-	if (*ep == '\0' && id >= 0 && id <= UINT_MAX) {
+	if (*req_group != '\0' && *ep == '\0' && id >= 0 && id <= UINT_MAX) {
 		return (id);
 	}
 
@@ -265,8 +276,8 @@ static char *remove_whitespace(char *string, int remove_colon_and_brace)
 	end = start+(strlen(start))-1;
 	while ((*end == ' ' || *end == '\t' || (remove_colon_and_brace && (*end == ':' || *end == '{'))) && end > start)
 		end--;
-	if (end != start)
-		*(end+1) = '\0';
+	if (*end != '\0')
+		*(end + 1) = '\0';
 
 	return start;
 }
@@ -274,25 +285,43 @@ static char *remove_whitespace(char *string, int remove_colon_and_brace)
 
 
 static int parse_section(FILE *fp,
-			 char *path,
-			 const char **error_string,
-			 int depth,
-			 parser_cb_f parser_cb,
-			 icmap_map_t config_map,
-			 void *user_data)
+			const char *fname,
+			int *line_no,
+			char *path,
+			const char **error_string,
+			int depth,
+			enum main_cp_cb_data_state state,
+			parser_cb_f parser_cb,
+			icmap_map_t config_map,
+			void *user_data)
 {
 	char line[512];
 	int i;
 	char *loc;
 	int ignore_line;
 	char new_keyname[ICMAP_KEYNAME_MAXLEN];
+	static char formated_err[384];
+	const char *tmp_error_string;
 
 	if (strcmp(path, "") == 0) {
-		parser_cb("", NULL, NULL, PARSER_CB_START, error_string, config_map, user_data);
+		parser_cb("", NULL, NULL, &state, PARSER_CB_START, error_string, config_map, user_data);
 	}
 
+	tmp_error_string = NULL;
+
 	while (fgets (line, sizeof (line), fp)) {
+		(*line_no)++;
+
 		if (strlen(line) > 0) {
+			/*
+			 * Check if complete line was read. Use feof to handle files
+			 * without ending \n at the end of the file
+			 */
+			if ((line[strlen(line) - 1] != '\n') && !feof(fp)) {
+				tmp_error_string = "Line too long";
+				goto parse_error;
+			}
+
 			if (line[strlen(line) - 1] == '\n')
 				line[strlen(line) - 1] = '\0';
 			if (strlen (line) > 0 && line[strlen(line) - 1] == '\r')
@@ -327,14 +356,27 @@ static int parse_section(FILE *fp,
 
 		/* New section ? */
 		if ((loc = strchr_rs (line, '{'))) {
-			char *section = remove_whitespace(line, 1);
+			char *section;
+			char *after_section;
+			enum main_cp_cb_data_state newstate;
 
-			loc--;
-			*loc = '\0';
+			*(loc-1) = '\0';
+			section = remove_whitespace(line, 1);
+			after_section = remove_whitespace(loc, 0);
+
+			if (strcmp(section, "") == 0) {
+				tmp_error_string = "Missing section name before opening bracket '{'";
+				goto parse_error;
+			}
+
+			if (strcmp(after_section, "") != 0) {
+				tmp_error_string = "Extra characters after opening bracket '{'";
+				goto parse_error;
+			}
 
 			if (strlen(path) + strlen(section) + 1 >= ICMAP_KEYNAME_MAXLEN) {
-				*error_string = "parser error: Start of section makes total cmap path too long";
-				return -1;
+				tmp_error_string = "Start of section makes total cmap path too long";
+				goto parse_error;
 			}
 			strcpy(new_keyname, path);
 			if (strcmp(path, "") != 0) {
@@ -342,11 +384,15 @@ static int parse_section(FILE *fp,
 			}
 			strcat(new_keyname, section);
 
-			if (!parser_cb(new_keyname, NULL, NULL, PARSER_CB_SECTION_START, error_string, config_map, user_data)) {
-				return -1;
+			/* Only use the new state for items further down the stack */
+			newstate = state;
+			if (!parser_cb(new_keyname, NULL, NULL, &newstate, PARSER_CB_SECTION_START,
+			    &tmp_error_string, config_map, user_data)) {
+				goto parse_error;
 			}
 
-			if (parse_section(fp, new_keyname, error_string, depth + 1, parser_cb, config_map, user_data))
+			if (parse_section(fp, fname, line_no, new_keyname, error_string, depth + 1, newstate,
+			    parser_cb, config_map, user_data))
 				return -1;
 
 			continue ;
@@ -362,8 +408,8 @@ static int parse_section(FILE *fp,
 			value = remove_whitespace(loc, 0);
 
 			if (strlen(path) + strlen(key) + 1 >= ICMAP_KEYNAME_MAXLEN) {
-				*error_string = "parser error: New key makes total cmap path too long";
-				return -1;
+				tmp_error_string = "New key makes total cmap path too long";
+				goto parse_error;
 			}
 			strcpy(new_keyname, path);
 			if (strcmp(path, "") != 0) {
@@ -371,38 +417,64 @@ static int parse_section(FILE *fp,
 			}
 			strcat(new_keyname, key);
 
-			if (!parser_cb(new_keyname, key, value, PARSER_CB_ITEM, error_string, config_map, user_data)) {
-				return -1;
+			if (!parser_cb(new_keyname, key, value, &state, PARSER_CB_ITEM, &tmp_error_string,
+			    config_map, user_data)) {
+				goto parse_error;
 			}
 
 			continue ;
 		}
 
 		if (strchr_rs (line, '}')) {
-			if (depth == 0) {
-				*error_string = "parser error: Unexpected closing brace";
+			char *trimmed_line;
+			trimmed_line = remove_whitespace(line, 0);
 
-				return -1;
+			if (strcmp(trimmed_line, "}") != 0) {
+				tmp_error_string = "Extra characters before or after closing bracket '}'";
+				goto parse_error;
 			}
 
-			if (!parser_cb(path, NULL, NULL, PARSER_CB_SECTION_END, error_string, config_map, user_data)) {
-				return -1;
+			if (depth == 0) {
+				tmp_error_string = "Unexpected closing brace";
+
+				goto parse_error;
+			}
+
+			if (!parser_cb(path, NULL, NULL, &state, PARSER_CB_SECTION_END, &tmp_error_string,
+			    config_map, user_data)) {
+				goto parse_error;
 			}
 
 			return 0;
 		}
+
+		/*
+		 * Line is not opening section, ending section or value -> error
+		 */
+		tmp_error_string = "Line is not opening or closing section or key value";
+		goto parse_error;
 	}
 
 	if (strcmp(path, "") != 0) {
-		*error_string = "parser error: Missing closing brace";
-		return -1;
+		tmp_error_string = "Missing closing brace";
+		goto parse_error;
 	}
 
 	if (strcmp(path, "") == 0) {
-		parser_cb("", NULL, NULL, PARSER_CB_END, error_string, config_map, user_data);
+		parser_cb("", NULL, NULL, &state, PARSER_CB_END, error_string, config_map, user_data);
 	}
 
 	return 0;
+
+parse_error:
+	if (snprintf(formated_err, sizeof(formated_err), "parser error: %s:%u: %s", fname, *line_no,
+	    tmp_error_string) >= sizeof(formated_err)) {
+		*error_string = "Can't format parser error message";
+	} else {
+		*error_string = formated_err;
+	}
+
+	return -1;
 }
 
 static int safe_atoq_range(icmap_value_types_t value_type, long long int *min_val, long long int *max_val)
@@ -483,9 +555,32 @@ static int str_to_ull(const char *str, unsigned long long int *res)
 	return (0);
 }
 
+static int handle_crypto_model(const char *val, const char **error_string)
+{
+
+	if (util_is_valid_knet_crypto_model(val, NULL, 0,
+	    "Invalid crypto model. Should be ", error_string) == 1) {
+		return (0);
+	} else {
+		return (-1);
+	}
+}
+
+static int handle_compress_model(const char *val, const char **error_string)
+{
+
+	if (util_is_valid_knet_compress_model(val, NULL, 0,
+	    "Invalid compression model. Should be ", error_string) == 1) {
+		return (0);
+	} else {
+		return (-1);
+	}
+}
+
 static int main_config_parser_cb(const char *path,
 			char *key,
 			char *value,
+			enum main_cp_cb_data_state *state,
 			enum parser_cb_type type,
 			const char **error_string,
 			icmap_map_t config_map,
@@ -497,24 +592,45 @@ static int main_config_parser_cb(const char *path,
 	icmap_value_types_t val_type = ICMAP_VALUETYPE_BINARY;
 	unsigned long long int ull;
 	int add_as_string;
-	char key_name[ICMAP_KEYNAME_MAXLEN];
+	char key_name[ICMAP_KEYNAME_MAXLEN + 1];
 	static char formated_err[256];
 	struct main_cp_cb_data *data = (struct main_cp_cb_data *)user_data;
 	struct key_value_list_item *kv_item;
-	struct list_head *iter, *iter_next;
+	struct qb_list_head *iter, *tmp_iter;
 	int uid, gid;
+	cs_error_t cs_err;
+
+	cs_err = CS_OK;
+
+	/*
+	 * Formally this check is not needed because length is checked by parse_section
+	 */
+	if (strlen(path) >= sizeof(key_name)) {
+		if (snprintf(formated_err, sizeof(formated_err),
+		    "Can't store path \"%s\" into key_name", path) >= sizeof(formated_err)) {
+			*error_string = "Can't format path into key_name error message";
+		} else {
+			*error_string = formated_err;
+		}
+		return (0);
+	}
+	/*
+	 * Key_name is used in atoi_error/icmap_set_error, but many of icmap_set*
+	 * are using path, so initialize key_name to valid value
+	 */
+	strncpy(key_name, path, sizeof(key_name) - 1);
 
 	switch (type) {
 	case PARSER_CB_START:
 		memset(data, 0, sizeof(struct main_cp_cb_data));
-		data->state = MAIN_CP_CB_DATA_STATE_NORMAL;
+		*state = MAIN_CP_CB_DATA_STATE_NORMAL;
 		break;
 	case PARSER_CB_END:
 		break;
 	case PARSER_CB_ITEM:
 		add_as_string = 1;
 
-		switch (data->state) {
+		switch (*state) {
 		case MAIN_CP_CB_DATA_STATE_NORMAL:
 			break;
 		case MAIN_CP_CB_DATA_STATE_PLOAD:
@@ -524,7 +640,9 @@ static int main_config_parser_cb(const char *path,
 				if (safe_atoq(value, &val, val_type) != 0) {
 					goto atoi_error;
 				}
-				icmap_set_uint32_r(config_map, path, val);
+				if ((cs_err = icmap_set_uint32_r(config_map, path, val)) != CS_OK) {
+					goto icmap_set_error;
+				}
 				add_as_string = 0;
 			}
 			break;
@@ -537,7 +655,9 @@ static int main_config_parser_cb(const char *path,
 				if (safe_atoq(value, &val, val_type) != 0) {
 					goto atoi_error;
 				}
-				icmap_set_uint32_r(config_map, path, val);
+				if ((cs_err = icmap_set_uint32_r(config_map, path, val)) != CS_OK) {
+					goto icmap_set_error;
+				}
 				add_as_string = 0;
 			}
 
@@ -551,7 +671,9 @@ static int main_config_parser_cb(const char *path,
 				if (safe_atoq(value, &val, val_type) != 0) {
 					goto atoi_error;
 				}
-				icmap_set_uint8_r(config_map, path, val);
+				if ((cs_err = icmap_set_uint8_r(config_map, path, val)) != CS_OK) {
+					goto icmap_set_error;
+				}
 				add_as_string = 0;
 			}
 			break;
@@ -563,7 +685,9 @@ static int main_config_parser_cb(const char *path,
 				if (safe_atoq(value, &val, val_type) != 0) {
 					goto atoi_error;
 				}
-				icmap_set_uint32_r(config_map, path, val);
+				if ((cs_err = icmap_set_uint32_r(config_map, path, val)) != CS_OK) {
+					goto icmap_set_error;
+				}
 				add_as_string = 0;
 			}
 			if ((strcmp(path, "quorum.device.master_wins") == 0)) {
@@ -571,7 +695,9 @@ static int main_config_parser_cb(const char *path,
 				if (safe_atoq(value, &val, val_type) != 0) {
 					goto atoi_error;
 				}
-				icmap_set_uint8_r(config_map, path, val);
+				if ((cs_err = icmap_set_uint8_r(config_map, path, val)) != CS_OK) {
+					goto icmap_set_error;
+				}
 				add_as_string = 0;
 			}
 			break;
@@ -582,6 +708,7 @@ static int main_config_parser_cb(const char *path,
 			    (strcmp(path, "totem.token") == 0) ||
 			    (strcmp(path, "totem.token_coefficient") == 0) ||
 			    (strcmp(path, "totem.token_retransmit") == 0) ||
+			    (strcmp(path, "totem.token_warning") == 0) ||
 			    (strcmp(path, "totem.hold") == 0) ||
 			    (strcmp(path, "totem.token_retransmits_before_loss_const") == 0) ||
 			    (strcmp(path, "totem.join") == 0) ||
@@ -601,47 +728,60 @@ static int main_config_parser_cb(const char *path,
 			    (strcmp(path, "totem.window_size") == 0) ||
 			    (strcmp(path, "totem.max_messages") == 0) ||
 			    (strcmp(path, "totem.miss_count_const") == 0) ||
+			    (strcmp(path, "totem.knet_pmtud_interval") == 0) ||
+			    (strcmp(path, "totem.knet_compression_threshold") == 0) ||
 			    (strcmp(path, "totem.netmtu") == 0)) {
 				val_type = ICMAP_VALUETYPE_UINT32;
 				if (safe_atoq(value, &val, val_type) != 0) {
 					goto atoi_error;
 				}
-				icmap_set_uint32_r(config_map,path, val);
+				if ((cs_err = icmap_set_uint32_r(config_map,path, val)) != CS_OK) {
+					goto icmap_set_error;
+				}
+				add_as_string = 0;
+			}
+			if (strcmp(path, "totem.knet_compression_level") == 0) {
+				val_type = ICMAP_VALUETYPE_INT32;
+				if (safe_atoq(value, &val, val_type) != 0) {
+					goto atoi_error;
+				}
+				if ((cs_err = icmap_set_int32_r(config_map, path, val)) != CS_OK) {
+					goto icmap_set_error;
+				}
 				add_as_string = 0;
 			}
 			if (strcmp(path, "totem.config_version") == 0) {
 				if (str_to_ull(value, &ull) != 0) {
 					goto atoi_error;
 				}
-				icmap_set_uint64_r(config_map, path, ull);
+				if ((cs_err = icmap_set_uint64_r(config_map, path, ull)) != CS_OK) {
+					goto icmap_set_error;
+				}
 				add_as_string = 0;
 			}
 			if (strcmp(path, "totem.ip_version") == 0) {
 				if ((strcmp(value, "ipv4") != 0) &&
-				    (strcmp(value, "ipv6") != 0)) {
+				    (strcmp(value, "ipv6") != 0) &&
+				    (strcmp(value, "ipv6-4") != 0) &&
+				    (strcmp(value, "ipv4-6") != 0)) {
 					*error_string = "Invalid ip_version type";
 
 					return (0);
 				}
 			}
-			if (strcmp(path, "totem.crypto_type") == 0) {
-				if ((strcmp(value, "nss") != 0) &&
-				    (strcmp(value, "aes256") != 0) &&
-				    (strcmp(value, "aes192") != 0) &&
-				    (strcmp(value, "aes128") != 0) &&
-				    (strcmp(value, "3des") != 0)) {
-					*error_string = "Invalid crypto type";
-
+			if (strcmp(path, "totem.crypto_model") == 0) {
+				if (handle_crypto_model(value, error_string) != 0) {
 					return (0);
 				}
 			}
+
 			if (strcmp(path, "totem.crypto_cipher") == 0) {
 				if ((strcmp(value, "none") != 0) &&
 				    (strcmp(value, "aes256") != 0) &&
 				    (strcmp(value, "aes192") != 0) &&
-				    (strcmp(value, "aes128") != 0) &&
-				    (strcmp(value, "3des") != 0)) {
-					*error_string = "Invalid cipher type";
+				    (strcmp(value, "aes128") != 0)) {
+					*error_string = "Invalid cipher type. "
+					    "Should be none, aes256, aes192 or aes128";
 
 					return (0);
 				}
@@ -653,19 +793,52 @@ static int main_config_parser_cb(const char *path,
 				    (strcmp(value, "sha256") != 0) &&
 				    (strcmp(value, "sha384") != 0) &&
 				    (strcmp(value, "sha512") != 0)) {
-					*error_string = "Invalid hash type";
+					*error_string = "Invalid hash type. "
+					    "Should be none, md5, sha1, sha256, sha384 or sha512";
 
 					return (0);
 				}
 			}
+
+			if (strcmp(path, "totem.knet_compression_model") == 0) {
+				if (handle_compress_model(value, error_string) != 0) {
+					return (0);
+				}
+			}
+
 			break;
 
-		case MAIN_CP_CB_DATA_STATE_QB:
-			if (strcmp(path, "qb.ipc_type") == 0) {
+		case MAIN_CP_CB_DATA_STATE_SYSTEM:
+			if (strcmp(path, "system.qb_ipc_type") == 0) {
 				if ((strcmp(value, "native") != 0) &&
 				    (strcmp(value, "shm") != 0) &&
 				    (strcmp(value, "socket") != 0)) {
-					*error_string = "Invalid qb ipc_type";
+					*error_string = "Invalid system.qb_ipc_type";
+
+					return (0);
+				}
+			}
+			if (strcmp(path, "system.sched_rr") == 0) {
+				if ((strcmp(value, "yes") != 0) &&
+				    (strcmp(value, "no") != 0)) {
+					*error_string = "Invalid system.sched_rr value";
+
+					return (0);
+				}
+			}
+			if (strcmp(path, "system.move_to_root_cgroup") == 0) {
+				if ((strcmp(value, "yes") != 0) &&
+				    (strcmp(value, "no") != 0) &&
+				    (strcmp(value, "auto") != 0)) {
+					*error_string = "Invalid system.move_to_root_cgroup";
+
+					return (0);
+				}
+			}
+			if (strcmp(path, "system.allow_knet_handle_fallback") == 0) {
+				if ((strcmp(value, "yes") != 0) &&
+				    (strcmp(value, "no") != 0)) {
+					*error_string = "Invalid system.allow_knet_handle_fallback";
 
 					return (0);
 				}
@@ -673,13 +846,13 @@ static int main_config_parser_cb(const char *path,
 			break;
 
 		case MAIN_CP_CB_DATA_STATE_INTERFACE:
-			if (strcmp(path, "totem.interface.ringnumber") == 0) {
+			if (strcmp(path, "totem.interface.linknumber") == 0) {
 				val_type = ICMAP_VALUETYPE_UINT8;
 				if (safe_atoq(value, &val, val_type) != 0) {
 					goto atoi_error;
 				}
 
-				data->ringnumber = val;
+				data->linknumber = val;
 				add_as_string = 0;
 			}
 			if (strcmp(path, "totem.interface.bindnetaddr") == 0) {
@@ -710,6 +883,51 @@ static int main_config_parser_cb(const char *path,
 				data->ttl = val;
 				add_as_string = 0;
 			}
+			if (strcmp(path, "totem.interface.knet_link_priority") == 0) {
+				val_type = ICMAP_VALUETYPE_UINT8;
+				if (safe_atoq(value, &val, val_type) != 0) {
+					goto atoi_error;
+				}
+				data->knet_link_priority = val;
+				add_as_string = 0;
+			}
+			if (strcmp(path, "totem.interface.knet_ping_interval") == 0) {
+				val_type = ICMAP_VALUETYPE_UINT32;
+				if (safe_atoq(value, &val, val_type) != 0) {
+					goto atoi_error;
+				}
+				data->knet_ping_interval = val;
+				add_as_string = 0;
+			}
+			if (strcmp(path, "totem.interface.knet_ping_timeout") == 0) {
+				val_type = ICMAP_VALUETYPE_UINT32;
+				if (safe_atoq(value, &val, val_type) != 0) {
+					goto atoi_error;
+				}
+				data->knet_ping_timeout = val;
+				add_as_string = 0;
+			}
+			if (strcmp(path, "totem.interface.knet_ping_precision") == 0) {
+				val_type = ICMAP_VALUETYPE_UINT32;
+				if (safe_atoq(value, &val, val_type) != 0) {
+					goto atoi_error;
+				}
+				data->knet_ping_precision = val;
+				add_as_string = 0;
+			}
+			if (strcmp(path, "totem.interface.knet_pong_count") == 0) {
+				val_type = ICMAP_VALUETYPE_UINT32;
+				if (safe_atoq(value, &val, val_type) != 0) {
+					goto atoi_error;
+				}
+				data->knet_pong_count = val;
+				add_as_string = 0;
+			}
+			if (strcmp(path, "totem.interface.knet_transport") == 0) {
+				val_type = ICMAP_VALUETYPE_STRING;
+				data->knet_transport = strdup(value);
+				add_as_string = 0;
+			}
 			break;
 		case MAIN_CP_CB_DATA_STATE_LOGGER_SUBSYS:
 			if (strcmp(key, "subsys") == 0) {
@@ -736,8 +954,8 @@ static int main_config_parser_cb(const char *path,
 
 					return (0);
 				}
-				list_init(&kv_item->list);
-				list_add(&kv_item->list, &data->logger_subsys_items_head);
+				qb_list_init(&kv_item->list);
+				qb_list_add(&kv_item->list, &data->logger_subsys_items_head);
 			}
 			add_as_string = 0;
 			break;
@@ -773,8 +991,8 @@ static int main_config_parser_cb(const char *path,
 
 					return (0);
 				}
-				list_init(&kv_item->list);
-				list_add(&kv_item->list, &data->logger_subsys_items_head);
+				qb_list_init(&kv_item->list);
+				qb_list_add(&kv_item->list, &data->logger_subsys_items_head);
 			}
 			add_as_string = 0;
 			break;
@@ -785,9 +1003,11 @@ static int main_config_parser_cb(const char *path,
 					*error_string = error_string_response;
 					return (0);
 				}
-				snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "uidgid.uid.%u",
+				snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "uidgid.config.uid.%u",
 						uid);
-				icmap_set_uint8_r(config_map, key_name, 1);
+				if ((cs_err = icmap_set_uint8_r(config_map, key_name, 1)) != CS_OK) {
+					goto icmap_set_error;
+				}
 				add_as_string = 0;
 			} else if (strcmp(key, "gid") == 0) {
 				gid = gid_determine(value);
@@ -795,9 +1015,11 @@ static int main_config_parser_cb(const char *path,
 					*error_string = error_string_response;
 					return (0);
 				}
-				snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "uidgid.gid.%u",
+				snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "uidgid.config.gid.%u",
 						gid);
-				icmap_set_uint8_r(config_map, key_name, 1);
+				if ((cs_err = icmap_set_uint8_r(config_map, key_name, 1)) != CS_OK) {
+					goto icmap_set_error;
+				}
 				add_as_string = 0;
 			} else {
 				*error_string = "uidgid: Only uid and gid are allowed items";
@@ -827,8 +1049,8 @@ static int main_config_parser_cb(const char *path,
 
 				return (0);
 			}
-			list_init(&kv_item->list);
-			list_add(&kv_item->list, &data->member_items_head);
+			qb_list_init(&kv_item->list);
+			qb_list_add(&kv_item->list, &data->member_items_head);
 			add_as_string = 0;
 			break;
 		case MAIN_CP_CB_DATA_STATE_NODELIST:
@@ -842,145 +1064,260 @@ static int main_config_parser_cb(const char *path,
 					goto atoi_error;
 				}
 
-				icmap_set_uint32_r(config_map, key_name, val);
+				if ((cs_err = icmap_set_uint32_r(config_map, key_name, val)) != CS_OK) {
+					goto icmap_set_error;
+				}
 				add_as_string = 0;
 			}
 
-			if (strcmp(key, "ring0_addr") == 0) {
-				data->ring0_addr_added = 1;
-			}
-
 			if (add_as_string) {
-				icmap_set_string_r(config_map, key_name, value);
+				if ((cs_err = icmap_set_string_r(config_map, key_name, value)) != CS_OK) {
+					goto icmap_set_error;
+				};
+				add_as_string = 0;
+			}
+			break;
+		case MAIN_CP_CB_DATA_STATE_RESOURCES:
+			if (strcmp(key, "watchdog_timeout") == 0) {
+				val_type = ICMAP_VALUETYPE_UINT32;
+				if (safe_atoq(value, &val, val_type) != 0) {
+					goto atoi_error;
+				}
+				if ((cs_err = icmap_set_uint32_r(config_map,path, val)) != CS_OK) {
+					goto icmap_set_error;
+				}
+				add_as_string = 0;
+			}
+			break;
+		case MAIN_CP_CB_DATA_STATE_RESOURCES_SYSTEM:
+		case MAIN_CP_CB_DATA_STATE_RESOURCES_SYSTEM_MEMUSED:
+			if (strcmp(key, "poll_period") == 0) {
+				if (str_to_ull(value, &ull) != 0) {
+					goto atoi_error;
+				}
+				if ((cs_err = icmap_set_uint64_r(config_map,path, ull)) != CS_OK) {
+					goto icmap_set_error;
+				}
+				add_as_string = 0;
+			}
+			break;
+		case MAIN_CP_CB_DATA_STATE_RESOURCES_PROCESS:
+		case MAIN_CP_CB_DATA_STATE_RESOURCES_PROCESS_MEMUSED:
+			if (strcmp(key, "poll_period") == 0) {
+				if (str_to_ull(value, &ull) != 0) {
+					goto atoi_error;
+				}
+				if ((cs_err = icmap_set_uint64_r(config_map,path, ull)) != CS_OK) {
+					goto icmap_set_error;
+				}
 				add_as_string = 0;
 			}
 			break;
 		}
 
 		if (add_as_string) {
-			icmap_set_string_r(config_map, path, value);
+			if ((cs_err = icmap_set_string_r(config_map, path, value)) != CS_OK) {
+				goto icmap_set_error;
+			}
 		}
 		break;
 	case PARSER_CB_SECTION_START:
 		if (strcmp(path, "totem.interface") == 0) {
-			data->state = MAIN_CP_CB_DATA_STATE_INTERFACE;
-			data->ringnumber = 0;
+			*state = MAIN_CP_CB_DATA_STATE_INTERFACE;
+			data->linknumber = 0;
 			data->mcastport = -1;
 			data->ttl = -1;
-			list_init(&data->member_items_head);
+			data->knet_link_priority = -1;
+			data->knet_ping_interval = -1;
+			data->knet_ping_timeout = -1;
+			data->knet_ping_precision = -1;
+			data->knet_pong_count = -1;
+			data->knet_transport = NULL;
+			qb_list_init(&data->member_items_head);
 		};
 		if (strcmp(path, "totem") == 0) {
-			data->state = MAIN_CP_CB_DATA_STATE_TOTEM;
+			*state = MAIN_CP_CB_DATA_STATE_TOTEM;
 		};
-		if (strcmp(path, "qb") == 0) {
-			data->state = MAIN_CP_CB_DATA_STATE_QB;
+		if (strcmp(path, "system") == 0) {
+			*state = MAIN_CP_CB_DATA_STATE_SYSTEM;
 		}
 		if (strcmp(path, "logging.logger_subsys") == 0) {
-			data->state = MAIN_CP_CB_DATA_STATE_LOGGER_SUBSYS;
-			list_init(&data->logger_subsys_items_head);
+			*state = MAIN_CP_CB_DATA_STATE_LOGGER_SUBSYS;
+			qb_list_init(&data->logger_subsys_items_head);
 			data->subsys = NULL;
 		}
 		if (strcmp(path, "logging.logging_daemon") == 0) {
-			data->state = MAIN_CP_CB_DATA_STATE_LOGGING_DAEMON;
-			list_init(&data->logger_subsys_items_head);
+			*state = MAIN_CP_CB_DATA_STATE_LOGGING_DAEMON;
+			qb_list_init(&data->logger_subsys_items_head);
 			data->subsys = NULL;
 			data->logging_daemon_name = NULL;
 		}
 		if (strcmp(path, "uidgid") == 0) {
-			data->state = MAIN_CP_CB_DATA_STATE_UIDGID;
+			*state = MAIN_CP_CB_DATA_STATE_UIDGID;
 		}
 		if (strcmp(path, "totem.interface.member") == 0) {
-			data->state = MAIN_CP_CB_DATA_STATE_MEMBER;
+			*state = MAIN_CP_CB_DATA_STATE_MEMBER;
 		}
 		if (strcmp(path, "quorum") == 0) {
-			data->state = MAIN_CP_CB_DATA_STATE_QUORUM;
+			*state = MAIN_CP_CB_DATA_STATE_QUORUM;
 		}
 		if (strcmp(path, "quorum.device") == 0) {
-			data->state = MAIN_CP_CB_DATA_STATE_QDEVICE;
+			*state = MAIN_CP_CB_DATA_STATE_QDEVICE;
 		}
 		if (strcmp(path, "nodelist") == 0) {
-			data->state = MAIN_CP_CB_DATA_STATE_NODELIST;
+			*state = MAIN_CP_CB_DATA_STATE_NODELIST;
 			data->node_number = 0;
 		}
 		if (strcmp(path, "nodelist.node") == 0) {
-			data->state = MAIN_CP_CB_DATA_STATE_NODELIST_NODE;
-			data->ring0_addr_added = 0;
+			*state = MAIN_CP_CB_DATA_STATE_NODELIST_NODE;
+		}
+		if (strcmp(path, "resources") == 0) {
+			*state = MAIN_CP_CB_DATA_STATE_RESOURCES;
+		}
+		if (strcmp(path, "resources.system") == 0) {
+			*state = MAIN_CP_CB_DATA_STATE_RESOURCES_SYSTEM;
+		}
+		if (strcmp(path, "resources.system.memory_used") == 0) {
+			*state = MAIN_CP_CB_DATA_STATE_RESOURCES_SYSTEM_MEMUSED;
+		}
+		if (strcmp(path, "resources.process") == 0) {
+			*state = MAIN_CP_CB_DATA_STATE_RESOURCES_PROCESS;
+		}
+		if (strcmp(path, "resources.process.memory_used") == 0) {
+			*state = MAIN_CP_CB_DATA_STATE_RESOURCES_PROCESS_MEMUSED;
 		}
 		break;
 	case PARSER_CB_SECTION_END:
-		switch (data->state) {
-		case MAIN_CP_CB_DATA_STATE_NORMAL:
-			break;
-		case MAIN_CP_CB_DATA_STATE_PLOAD:
-			data->state = MAIN_CP_CB_DATA_STATE_NORMAL;
-			break;
+		switch (*state) {
 		case MAIN_CP_CB_DATA_STATE_INTERFACE:
 			/*
 			 * Create new interface section
 			 */
 			if (data->bindnetaddr != NULL) {
 				snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "totem.interface.%u.bindnetaddr",
-						data->ringnumber);
-				icmap_set_string_r(config_map, key_name, data->bindnetaddr);
+						data->linknumber);
+				cs_err = icmap_set_string_r(config_map, key_name, data->bindnetaddr);
 
 				free(data->bindnetaddr);
 				data->bindnetaddr = NULL;
+
+				if (cs_err != CS_OK) {
+					goto icmap_set_error;
+				}
 			}
 
 			if (data->mcastaddr != NULL) {
 				snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "totem.interface.%u.mcastaddr",
-						data->ringnumber);
-				icmap_set_string_r(config_map, key_name, data->mcastaddr);
+						data->linknumber);
+				cs_err = icmap_set_string_r(config_map, key_name, data->mcastaddr);
 
 				free(data->mcastaddr);
 				data->mcastaddr = NULL;
+
+				if (cs_err != CS_OK) {
+					goto icmap_set_error;
+				}
 			}
 
 			if (data->broadcast != NULL) {
 				snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "totem.interface.%u.broadcast",
-						data->ringnumber);
-				icmap_set_string_r(config_map, key_name, data->broadcast);
+						data->linknumber);
+				cs_err = icmap_set_string_r(config_map, key_name, data->broadcast);
 
 				free(data->broadcast);
 				data->broadcast = NULL;
+
+				if (cs_err != CS_OK) {
+					goto icmap_set_error;
+				}
 			}
 
 			if (data->mcastport > -1) {
 				snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "totem.interface.%u.mcastport",
-						data->ringnumber);
-				icmap_set_uint16_r(config_map, key_name, data->mcastport);
+						data->linknumber);
+				if ((cs_err = icmap_set_uint16_r(config_map, key_name,
+				    data->mcastport)) != CS_OK) {
+					goto icmap_set_error;
+				}
 			}
 
 			if (data->ttl > -1) {
 				snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "totem.interface.%u.ttl",
-						data->ringnumber);
-				icmap_set_uint8_r(config_map, key_name, data->ttl);
+						data->linknumber);
+				if ((cs_err = icmap_set_uint8_r(config_map, key_name, data->ttl)) != CS_OK) {
+					goto icmap_set_error;
+				}
+			}
+			if (data->knet_link_priority > -1) {
+				snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "totem.interface.%u.knet_link_priority",
+						data->linknumber);
+				if ((cs_err = icmap_set_uint8_r(config_map, key_name,
+				    data->knet_link_priority)) != CS_OK) {
+					goto icmap_set_error;
+				}
+			}
+			if (data->knet_ping_interval > -1) {
+				snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "totem.interface.%u.knet_ping_interval",
+						data->linknumber);
+				if ((cs_err = icmap_set_uint32_r(config_map, key_name,
+				    data->knet_ping_interval)) != CS_OK) {
+					goto icmap_set_error;
+				}
+			}
+			if (data->knet_ping_timeout > -1) {
+				snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "totem.interface.%u.knet_ping_timeout",
+						data->linknumber);
+				if ((cs_err = icmap_set_uint32_r(config_map, key_name,
+				    data->knet_ping_timeout)) != CS_OK) {
+					goto icmap_set_error;
+				}
+			}
+			if (data->knet_ping_precision > -1) {
+				snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "totem.interface.%u.knet_ping_precision",
+						data->linknumber);
+				if ((cs_err = icmap_set_uint32_r(config_map, key_name,
+				    data->knet_ping_precision)) != CS_OK) {
+					goto icmap_set_error;
+				}
+			}
+			if (data->knet_pong_count > -1) {
+				snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "totem.interface.%u.knet_pong_count",
+						data->linknumber);
+				if ((cs_err = icmap_set_uint32_r(config_map, key_name,
+				    data->knet_pong_count)) != CS_OK) {
+					goto icmap_set_error;
+				}
+			}
+			if (data->knet_transport) {
+				snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "totem.interface.%u.knet_transport",
+						data->linknumber);
+				cs_err = icmap_set_string_r(config_map, key_name, data->knet_transport);
+				free(data->knet_transport);
+
+				if (cs_err != CS_OK) {
+					goto icmap_set_error;
+				}
 			}
 
 			ii = 0;
-			for (iter = data->member_items_head.next;
-			     iter != &data->member_items_head; iter = iter_next) {
-				kv_item = list_entry(iter, struct key_value_list_item, list);
+
+			qb_list_for_each_safe(iter, tmp_iter, &(data->member_items_head)) {
+				kv_item = qb_list_entry(iter, struct key_value_list_item, list);
 
 				snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "totem.interface.%u.member.%u",
-						data->ringnumber, ii);
-				icmap_set_string_r(config_map, key_name, kv_item->value);
-
-				iter_next = iter->next;
+						data->linknumber, ii);
+				cs_err = icmap_set_string_r(config_map, key_name, kv_item->value);
 
 				free(kv_item->value);
 				free(kv_item->key);
 				free(kv_item);
 				ii++;
+
+				if (cs_err != CS_OK) {
+					goto icmap_set_error;
+				}
 			}
 
-			data->state = MAIN_CP_CB_DATA_STATE_TOTEM;
-			break;
-		case MAIN_CP_CB_DATA_STATE_TOTEM:
-			data->state = MAIN_CP_CB_DATA_STATE_NORMAL;
-			break;
-		case MAIN_CP_CB_DATA_STATE_QB:
-			data->state = MAIN_CP_CB_DATA_STATE_NORMAL;
 			break;
 		case MAIN_CP_CB_DATA_STATE_LOGGER_SUBSYS:
 			if (data->subsys == NULL) {
@@ -989,28 +1326,31 @@ static int main_config_parser_cb(const char *path,
 				return (0);
 			}
 
-			for (iter = data->logger_subsys_items_head.next;
-			     iter != &data->logger_subsys_items_head; iter = iter_next) {
-				kv_item = list_entry(iter, struct key_value_list_item, list);
+			qb_list_for_each_safe(iter, tmp_iter, &(data->logger_subsys_items_head)) {
+				kv_item = qb_list_entry(iter, struct key_value_list_item, list);
 
 				snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "logging.logger_subsys.%s.%s",
-						data->subsys, kv_item->key);
-				icmap_set_string_r(config_map, key_name, kv_item->value);
-
-				iter_next = iter->next;
+					 data->subsys, kv_item->key);
+				cs_err = icmap_set_string_r(config_map, key_name, kv_item->value);
 
 				free(kv_item->value);
 				free(kv_item->key);
 				free(kv_item);
+
+				if (cs_err != CS_OK) {
+					goto icmap_set_error;
+				}
 			}
 
 			snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "logging.logger_subsys.%s.subsys",
 					data->subsys);
-			icmap_set_string_r(config_map, key_name, data->subsys);
+			cs_err = icmap_set_string_r(config_map, key_name, data->subsys);
 
 			free(data->subsys);
 
-			data->state = MAIN_CP_CB_DATA_STATE_NORMAL;
+			if (cs_err != CS_OK) {
+				goto icmap_set_error;
+			}
 			break;
 		case MAIN_CP_CB_DATA_STATE_LOGGING_DAEMON:
 			if (data->logging_daemon_name == NULL) {
@@ -1019,9 +1359,8 @@ static int main_config_parser_cb(const char *path,
 				return (0);
 			}
 
-			for (iter = data->logger_subsys_items_head.next;
-			     iter != &data->logger_subsys_items_head; iter = iter_next) {
-				kv_item = list_entry(iter, struct key_value_list_item, list);
+			qb_list_for_each_safe(iter, tmp_iter, &(data->logger_subsys_items_head)) {
+				kv_item = qb_list_entry(iter, struct key_value_list_item, list);
 
 				if (data->subsys == NULL) {
 					if (strcmp(data->logging_daemon_name, "corosync") == 0) {
@@ -1046,65 +1385,80 @@ static int main_config_parser_cb(const char *path,
 								kv_item->key);
 					}
 				}
-				icmap_set_string_r(config_map, key_name, kv_item->value);
-
-				iter_next = iter->next;
+				cs_err = icmap_set_string_r(config_map, key_name, kv_item->value);
 
 				free(kv_item->value);
 				free(kv_item->key);
 				free(kv_item);
+
+				if (cs_err != CS_OK) {
+					goto icmap_set_error;
+				}
 			}
 
 			if (data->subsys == NULL) {
 				if (strcmp(data->logging_daemon_name, "corosync") != 0) {
 					snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "logging.logging_daemon.%s.name",
 							data->logging_daemon_name);
-					icmap_set_string_r(config_map, key_name, data->logging_daemon_name);
+					cs_err = icmap_set_string_r(config_map, key_name, data->logging_daemon_name);
 				}
 			} else {
 				if (strcmp(data->logging_daemon_name, "corosync") == 0) {
 					snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "logging.logger_subsys.%s.subsys",
 							data->subsys);
-					icmap_set_string_r(config_map, key_name, data->subsys);
+					cs_err = icmap_set_string_r(config_map, key_name, data->subsys);
 
 				} else {
 					snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "logging.logging_daemon.%s.%s.subsys",
 							data->logging_daemon_name, data->subsys);
-					icmap_set_string_r(config_map, key_name, data->subsys);
+					cs_err = icmap_set_string_r(config_map, key_name, data->subsys);
+
+					if (cs_err != CS_OK) {
+						free(data->subsys);
+						free(data->logging_daemon_name);
+
+						goto icmap_set_error;
+					}
 					snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "logging.logging_daemon.%s.%s.name",
 							data->logging_daemon_name, data->subsys);
-					icmap_set_string_r(config_map, key_name, data->logging_daemon_name);
+					cs_err = icmap_set_string_r(config_map, key_name, data->logging_daemon_name);
 				}
 			}
 
 			free(data->subsys);
 			free(data->logging_daemon_name);
 
-			data->state = MAIN_CP_CB_DATA_STATE_NORMAL;
-			break;
-		case MAIN_CP_CB_DATA_STATE_UIDGID:
-			data->state = MAIN_CP_CB_DATA_STATE_UIDGID;
-			break;
-		case MAIN_CP_CB_DATA_STATE_MEMBER:
-			data->state = MAIN_CP_CB_DATA_STATE_INTERFACE;
-			break;
-		case MAIN_CP_CB_DATA_STATE_QUORUM:
-			data->state = MAIN_CP_CB_DATA_STATE_NORMAL;
-			break;
-		case MAIN_CP_CB_DATA_STATE_QDEVICE:
-			data->state = MAIN_CP_CB_DATA_STATE_QUORUM;
-			break;
-		case MAIN_CP_CB_DATA_STATE_NODELIST:
-			data->state = MAIN_CP_CB_DATA_STATE_NORMAL;
+			if (cs_err != CS_OK) {
+				goto icmap_set_error;
+			}
 			break;
 		case MAIN_CP_CB_DATA_STATE_NODELIST_NODE:
-			if (!data->ring0_addr_added) {
-				*error_string = "No ring0_addr specified for node";
-
-				return (0);
-			}
 			data->node_number++;
-			data->state = MAIN_CP_CB_DATA_STATE_NODELIST;
+			break;
+		case MAIN_CP_CB_DATA_STATE_NORMAL:
+		case MAIN_CP_CB_DATA_STATE_PLOAD:
+		case MAIN_CP_CB_DATA_STATE_UIDGID:
+		case MAIN_CP_CB_DATA_STATE_MEMBER:
+		case MAIN_CP_CB_DATA_STATE_QUORUM:
+		case MAIN_CP_CB_DATA_STATE_QDEVICE:
+		case MAIN_CP_CB_DATA_STATE_NODELIST:
+		case MAIN_CP_CB_DATA_STATE_TOTEM:
+		case MAIN_CP_CB_DATA_STATE_SYSTEM:
+			break;
+		case MAIN_CP_CB_DATA_STATE_RESOURCES:
+			*state = MAIN_CP_CB_DATA_STATE_NORMAL;
+			break;
+		case MAIN_CP_CB_DATA_STATE_RESOURCES_SYSTEM:
+			*state = MAIN_CP_CB_DATA_STATE_RESOURCES;
+			break;
+		case MAIN_CP_CB_DATA_STATE_RESOURCES_SYSTEM_MEMUSED:
+			*state = MAIN_CP_CB_DATA_STATE_RESOURCES_SYSTEM;
+			break;
+		case MAIN_CP_CB_DATA_STATE_RESOURCES_PROCESS:
+			*state = MAIN_CP_CB_DATA_STATE_RESOURCES;
+			break;
+		case MAIN_CP_CB_DATA_STATE_RESOURCES_PROCESS_MEMUSED:
+			*state = MAIN_CP_CB_DATA_STATE_RESOURCES_PROCESS;
 			break;
 		}
 		break;
@@ -1120,10 +1474,24 @@ atoi_error:
 	 */
 	assert(safe_atoq_range(val_type, &min_val, &max_val) == 0);
 
-	snprintf(formated_err, sizeof(formated_err),
+	if (snprintf(formated_err, sizeof(formated_err),
 	    "Value of key \"%s\" is expected to be integer in range (%lld..%lld), but \"%s\" was given",
-	    key, min_val, max_val, value);
-	*error_string = formated_err;
+	    key_name, min_val, max_val, value) >= sizeof(formated_err)) {
+		*error_string = "Can't format parser error message";
+	} else {
+		*error_string = formated_err;
+	}
+
+	return (0);
+
+icmap_set_error:
+	if (snprintf(formated_err, sizeof(formated_err),
+	    "Can't store key \"%s\" into icmap, returned error is %s",
+	    key_name, cs_strerror(cs_err)) >= sizeof(formated_err)) {
+		*error_string = "Can't format parser error message";
+	} else {
+		*error_string = formated_err;
+	}
 
 	return (0);
 }
@@ -1131,6 +1499,7 @@ atoi_error:
 static int uidgid_config_parser_cb(const char *path,
 			char *key,
 			char *value,
+			enum main_cp_cb_data_state *state,
 			enum parser_cb_type type,
 			const char **error_string,
 			icmap_map_t config_map,
@@ -1138,6 +1507,8 @@ static int uidgid_config_parser_cb(const char *path,
 {
 	char key_name[ICMAP_KEYNAME_MAXLEN];
 	int uid, gid;
+	static char formated_err[256];
+	cs_error_t cs_err;
 
 	switch (type) {
 	case PARSER_CB_START:
@@ -1151,18 +1522,22 @@ static int uidgid_config_parser_cb(const char *path,
 				*error_string = error_string_response;
 				return (0);
 			}
-			snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "uidgid.uid.%u",
+			snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "uidgid.config.uid.%u",
 					uid);
-			icmap_set_uint8_r(config_map, key_name, 1);
+			if ((cs_err = icmap_set_uint8_r(config_map, key_name, 1)) != CS_OK) {
+				goto icmap_set_error;
+			}
 		} else if (strcmp(path, "uidgid.gid") == 0) {
 			gid = gid_determine(value);
 			if (gid == -1) {
 				*error_string = error_string_response;
 				return (0);
 			}
-			snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "uidgid.gid.%u",
+			snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "uidgid.config.gid.%u",
 					gid);
-			icmap_set_uint8_r(config_map, key_name, 1);
+			if ((cs_err = icmap_set_uint8_r(config_map, key_name, 1)) != CS_OK) {
+				goto icmap_set_error;
+			}
 		} else {
 			*error_string = "uidgid: Only uid and gid are allowed items";
 			return (0);
@@ -1179,6 +1554,17 @@ static int uidgid_config_parser_cb(const char *path,
 	}
 
 	return (1);
+
+icmap_set_error:
+	if (snprintf(formated_err, sizeof(formated_err),
+	    "Can't store key \"%s\" into icmap, returned error is %s",
+	    key_name, cs_strerror(cs_err)) >= sizeof(formated_err)) {
+		*error_string = "Can't format parser error message";
+	} else {
+		*error_string = formated_err;
+	}
+
+	return (0);
 }
 
 static int read_uidgid_files_into_icmap(
@@ -1186,36 +1572,54 @@ static int read_uidgid_files_into_icmap(
 	icmap_map_t config_map)
 {
 	FILE *fp;
-	const char *dirname;
+	char *dirname_res;
 	DIR *dp;
 	struct dirent *dirent;
-	struct dirent *entry;
 	char filename[PATH_MAX + FILENAME_MAX + 1];
+	char uidgid_dirname[PATH_MAX + FILENAME_MAX + 1];
 	int res = 0;
-	size_t len;
-	int return_code;
 	struct stat stat_buf;
+	enum main_cp_cb_data_state state = MAIN_CP_CB_DATA_STATE_NORMAL;
 	char key_name[ICMAP_KEYNAME_MAXLEN];
+	int line_no;
 
-	dirname = COROSYSCONFDIR "/uidgid.d";
-	dp = opendir (dirname);
+	/*
+	 * Build uidgid directory based on corosync.conf file location
+	 */
+	res = snprintf(filename, sizeof(filename), "%s",
+	    corosync_get_config_file());
+	if (res >= sizeof(filename)) {
+		*error_string = "uidgid.d path too long";
+
+		return (-1);
+	}
+
+	dirname_res = dirname(filename);
+
+	res = snprintf(uidgid_dirname, sizeof(uidgid_dirname), "%s/%s",
+	    dirname_res, "uidgid.d");
+	if (res >= sizeof(uidgid_dirname)) {
+		*error_string = "uidgid.d path too long";
+
+		return (-1);
+	}
+
+	dp = opendir (uidgid_dirname);
 
 	if (dp == NULL)
 		return 0;
 
-	len = offsetof(struct dirent, d_name) + FILENAME_MAX + 1;
+	for (dirent = readdir(dp);
+		dirent != NULL;
+		dirent = readdir(dp)) {
 
-	entry = malloc(len);
-	if (entry == NULL) {
-		res = 0;
-		goto error_exit;
-	}
+		res = snprintf(filename, sizeof (filename), "%s/%s", uidgid_dirname, dirent->d_name);
+		if (res >= sizeof(filename)) {
+			res = -1;
+			*error_string = "uidgid.d dirname path too long";
 
-	for (return_code = readdir_r(dp, entry, &dirent);
-		dirent != NULL && return_code == 0;
-		return_code = readdir_r(dp, entry, &dirent)) {
-
-		snprintf(filename, sizeof (filename), "%s/%s", dirname, dirent->d_name);
+			goto error_exit;
+		}
 		res = stat (filename, &stat_buf);
 		if (res == 0 && S_ISREG(stat_buf.st_mode)) {
 
@@ -1224,7 +1628,9 @@ static int read_uidgid_files_into_icmap(
 
 			key_name[0] = 0;
 
-			res = parse_section(fp, key_name, error_string, 0, uidgid_config_parser_cb, config_map, NULL);
+			line_no = 0;
+			res = parse_section(fp, filename, &line_no, key_name, error_string, 0, state,
+			    uidgid_config_parser_cb, config_map, NULL);
 
 			fclose (fp);
 
@@ -1235,7 +1641,6 @@ static int read_uidgid_files_into_icmap(
 	}
 
 error_exit:
-	free (entry);
 	closedir(dp);
 
 	return res;
@@ -1252,17 +1657,17 @@ static int read_config_file_into_icmap(
 	int res;
 	char key_name[ICMAP_KEYNAME_MAXLEN];
 	struct main_cp_cb_data data;
+	enum main_cp_cb_data_state state = MAIN_CP_CB_DATA_STATE_NORMAL;
+	int line_no;
 
-	filename = getenv ("COROSYNC_MAIN_CONFIG_FILE");
-	if (!filename)
-		filename = COROSYSCONFDIR "/corosync.conf";
+	filename = corosync_get_config_file();
 
 	fp = fopen (filename, "r");
 	if (fp == NULL) {
 		char error_str[100];
 		const char *error_ptr = qb_strerror_r(errno, error_str, sizeof(error_str));
 		snprintf (error_reason, sizeof(error_string_response),
-			"Can't read file %s reason = (%s)",
+			"Can't read file %s: %s",
 			 filename, error_ptr);
 		*error_string = error_reason;
 		return -1;
@@ -1270,7 +1675,9 @@ static int read_config_file_into_icmap(
 
 	key_name[0] = 0;
 
-	res = parse_section(fp, key_name, error_string, 0, main_config_parser_cb, config_map, &data);
+	line_no = 0;
+	res = parse_section(fp, filename, &line_no, key_name, error_string, 0, state,
+	    main_config_parser_cb, config_map, &data);
 
 	fclose(fp);
 

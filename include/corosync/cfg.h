@@ -60,15 +60,24 @@ typedef enum {
 	COROSYNC_CFG_SHUTDOWN_FLAG_IMMEDIATE = 2,
 } corosync_cfg_shutdown_flags_t;
 
+/**
+ * @brief enum corosync_cfg_shutdown_reply_flags_t
+ */
 typedef enum {
 	COROSYNC_CFG_SHUTDOWN_FLAG_NO = 0,
 	COROSYNC_CFG_SHUTDOWN_FLAG_YES = 1,
 } corosync_cfg_shutdown_reply_flags_t;
 
+/**
+ * @brief corosync_cfg_shutdown_callback_t callback
+ */
 typedef void (*corosync_cfg_shutdown_callback_t) (
 	corosync_cfg_handle_t cfg_handle,
 	corosync_cfg_shutdown_flags_t flags);
 
+/**
+ * @brief struct corosync_cfg_shutdown_callback_t
+ */
 typedef struct {
 	corosync_cfg_shutdown_callback_t corosync_cfg_shutdown_callback;
 } corosync_cfg_callbacks_t;
@@ -89,7 +98,6 @@ typedef struct
 	char address[sizeof(struct sockaddr_in6)];
 } corosync_cfg_node_address_t;
 
-
 /*
  * Interfaces
  */
@@ -97,25 +105,56 @@ typedef struct
 extern "C" {
 #endif
 
+/**
+ * @brief corosync_cfg_initialize
+ * @param cfg_handle
+ * @param cfg_callbacks
+ * @return
+ */
 cs_error_t
 corosync_cfg_initialize (
 	corosync_cfg_handle_t *cfg_handle,
 	const corosync_cfg_callbacks_t *cfg_callbacks);
 
+/**
+ * @brief corosync_cfg_fd_get
+ * @param cfg_handle
+ * @param selection_fd
+ * @return
+ */
 cs_error_t
 corosync_cfg_fd_get (
 	corosync_cfg_handle_t cfg_handle,
 	int32_t *selection_fd);
 
+/**
+ * @brief corosync_cfg_dispatch
+ * @param cfg_handle
+ * @param dispatch_flags
+ * @return
+ */
 cs_error_t
 corosync_cfg_dispatch (
 	corosync_cfg_handle_t cfg_handle,
 	cs_dispatch_flags_t dispatch_flags);
 
+/**
+ * @brief corosync_cfg_finalize
+ * @param cfg_handle
+ * @return
+ */
 cs_error_t
 corosync_cfg_finalize (
 	corosync_cfg_handle_t cfg_handle);
 
+/**
+ * @brief corosync_cfg_ring_status_get
+ * @param cfg_handle
+ * @param interface_names
+ * @param status
+ * @param interface_count
+ * @return
+ */
 cs_error_t
 corosync_cfg_ring_status_get (
 	corosync_cfg_handle_t cfg_handle,
@@ -123,41 +162,150 @@ corosync_cfg_ring_status_get (
 	char ***status,
 	unsigned int *interface_count);
 
-cs_error_t
-corosync_cfg_ring_reenable (
-	corosync_cfg_handle_t cfg_handle);
+typedef enum {
+	CFG_NODE_STATUS_V1 = 1,
+} corosync_cfg_node_status_version_t;
 
+#define CFG_MAX_HOST_LEN 256
+#define CFG_MAX_LINKS 8
+
+struct corosync_knet_link_status_v1 {
+	uint8_t enabled;	        /* link is configured and admin enabled for traffic */
+	uint8_t connected;              /* link is connected for data (local view) */
+	uint8_t dynconnected;	        /* link has been activated by remote dynip */
+	unsigned int mtu;		/* current detected MTU on this link */
+	char src_ipaddr[CFG_MAX_HOST_LEN];
+	char dst_ipaddr[CFG_MAX_HOST_LEN];
+};
+
+struct corosync_cfg_node_status_v1 {
+	corosync_cfg_node_status_version_t version;
+	unsigned int nodeid;
+	uint8_t reachable;
+	uint8_t remote;
+	uint8_t external;
+	uint8_t onwire_min;
+	uint8_t onwire_max;
+	uint8_t onwire_ver;
+	struct corosync_knet_link_status_v1 link_status[CFG_MAX_LINKS];
+};
+
+/**
+ * @brief corosync_cfg_node_status_get
+ * @param cfg_handle
+ * @param nodeid
+ * @param node_status
+ * @return
+ */
+cs_error_t
+corosync_cfg_node_status_get (
+	corosync_cfg_handle_t cfg_handle,
+	unsigned int nodeid,
+	corosync_cfg_node_status_version_t version,
+	void *node_status);
+
+/**
+ * @brief corosync_cfg_kill_node
+ * @param cfg_handle
+ * @param nodeid
+ * @param reason
+ * @return
+ */
 cs_error_t
 corosync_cfg_kill_node (
 	corosync_cfg_handle_t cfg_handle,
 	unsigned int nodeid,
 	const char *reason);
 
+/**
+ * @brief corosync_cfg_trackstart
+ * Track CFG for shutdown requests
+ * @param cfg_handle
+ * @param track_flags (none currently supported)
+ * @param reason
+ * @return
+ */
+cs_error_t
+corosync_cfg_trackstart (
+        corosync_cfg_handle_t cfg_handle,
+        uint8_t track_flags);
+
+/**
+ * @brief corosync_cfg_trackstop
+ * Stop tracking CFG for shutdown requests
+ * @param cfg_handle
+ * @param reason
+ * @return
+ */
+cs_error_t
+corosync_cfg_trackstop (
+        corosync_cfg_handle_t cfg_handle);
+
+/**
+ * @brief corosync_cfg_try_shutdown
+ * @param cfg_handle
+ * @param flags
+ * @return
+ */
 cs_error_t
 corosync_cfg_try_shutdown (
 	corosync_cfg_handle_t cfg_handle,
 	corosync_cfg_shutdown_flags_t flags);
 
-
+/**
+ * @brief corosync_cfg_replyto_shutdown
+ * @param cfg_handle
+ * @param flags
+ * @return
+ */
 cs_error_t
 corosync_cfg_replyto_shutdown (
 	corosync_cfg_handle_t cfg_handle,
 	corosync_cfg_shutdown_reply_flags_t flags);
 
+/**
+ * @brief corosync_cfg_get_node_addrs
+ * @param cfg_handle
+ * @param nodeid
+ * @param max_addrs
+ * @param num_addrs
+ * @param addrs
+ * @return
+ */
 cs_error_t
 corosync_cfg_get_node_addrs (
 	corosync_cfg_handle_t cfg_handle,
-	int nodeid,
+	unsigned int nodeid,
 	size_t max_addrs,
 	int *num_addrs,
 	corosync_cfg_node_address_t *addrs);
 
+/**
+ * @brief corosync_cfg_local_get
+ * @param handle
+ * @param local_nodeid
+ * @return
+ */
 cs_error_t
 corosync_cfg_local_get (
 	corosync_cfg_handle_t handle,
 	unsigned int *local_nodeid);
 
+/**
+ * @brief corosync_cfg_reload_config
+ * @param handle
+ * @return
+ */
 cs_error_t corosync_cfg_reload_config (
+	corosync_cfg_handle_t handle);
+
+/**
+ * @brief Reopen logging files
+ * @param handle CFG service handle
+ * @return CS_OK on success, CS_ERR_NOT_SUPPORTED if reopening of logging files is not available,
+ *         otherwise one of common errors.
+ */
+cs_error_t corosync_cfg_reopen_log_files (
 	corosync_cfg_handle_t handle);
 
 #ifdef __cplusplus

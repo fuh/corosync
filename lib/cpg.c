@@ -1,7 +1,7 @@
 /*
  * vi: set autoindent tabstop=4 shiftwidth=4 :
  *
- * Copyright (c) 2006-2012 Red Hat, Inc.
+ * Copyright (c) 2006-2015 Red Hat, Inc.
  *
  * All rights reserved.
  *
@@ -52,12 +52,12 @@
 #include <errno.h>
 #include <limits.h>
 
+#include <qb/qblist.h>
 #include <qb/qbdefs.h>
 #include <qb/qbipcc.h>
 #include <qb/qblog.h>
 
 #include <corosync/hdb.h>
-#include <corosync/list.h>
 #include <corosync/corotypes.h>
 #include <corosync/corodefs.h>
 #include <corosync/cpg.h>
@@ -70,9 +70,24 @@
 #endif
 
 /*
+ * Maximum number of times to retry a send when transmitting
+ * a large message fragment
+ */
+#define MAX_RETRIES 100
+
+/*
  * ZCB files have following umask (umask is same as used in libqb)
  */
 #define CPG_MEMORY_MAP_UMASK		077
+
+struct cpg_assembly_data
+{
+	struct qb_list_head list;
+	uint32_t nodeid;
+	uint32_t pid;
+	char *assembly_buf;
+	uint32_t assembly_buf_ptr;
+};
 
 struct cpg_inst {
 	qb_ipcc_connection_t *c;
@@ -82,7 +97,9 @@ struct cpg_inst {
 		cpg_model_data_t model_data;
 		cpg_model_v1_data_t model_v1_data;
 	};
-	struct list_head iteration_list_head;
+	struct qb_list_head iteration_list_head;
+	uint32_t max_msg_size;
+	struct qb_list_head assembly_list_head;
 };
 static void cpg_inst_free (void *inst);
 
@@ -92,7 +109,7 @@ struct cpg_iteration_instance_t {
 	cpg_iteration_handle_t cpg_iteration_handle;
 	qb_ipcc_connection_t *conn;
 	hdb_handle_t executive_iteration_handle;
-	struct list_head list;
+	struct qb_list_head list;
 };
 
 DECLARE_HDB_DATABASE(cpg_iteration_handle_t_db,NULL);
@@ -116,7 +133,7 @@ coroipcc_msg_send_reply_receive (
 
 static void cpg_iteration_instance_finalize (struct cpg_iteration_instance_t *cpg_iteration_instance)
 {
-	list_del (&cpg_iteration_instance->list);
+	qb_list_del (&cpg_iteration_instance->list);
 	hdb_handle_destroy (&cpg_iteration_handle_t_db, cpg_iteration_instance->cpg_iteration_handle);
 }
 
@@ -128,16 +145,14 @@ static void cpg_inst_free (void *inst)
 
 static void cpg_inst_finalize (struct cpg_inst *cpg_inst, hdb_handle_t handle)
 {
-	struct list_head *iter, *iter_next;
+	struct qb_list_head *iter, *tmp_iter;
 	struct cpg_iteration_instance_t *cpg_iteration_instance;
 
 	/*
 	 * Traverse thru iteration instances and delete them
 	 */
-	for (iter = cpg_inst->iteration_list_head.next;	iter != &cpg_inst->iteration_list_head;iter = iter_next) {
-		iter_next = iter->next;
-
-		cpg_iteration_instance = list_entry (iter, struct cpg_iteration_instance_t, list);
+	qb_list_for_each_safe(iter, tmp_iter, &(cpg_inst->iteration_list_head)) {
+		cpg_iteration_instance = qb_list_entry (iter, struct cpg_iteration_instance_t, list);
 
 		cpg_iteration_instance_finalize (cpg_iteration_instance);
 	}
@@ -210,10 +225,14 @@ cs_error_t cpg_model_initialize (
 		}
 	}
 
+	/* Allow space for corosync internal headers */
+	cpg_inst->max_msg_size = IPC_REQUEST_SIZE - 1024;
 	cpg_inst->model_data.model = model;
 	cpg_inst->context = context;
 
-	list_init(&cpg_inst->iteration_list_head);
+	qb_list_init(&cpg_inst->iteration_list_head);
+
+	qb_list_init(&cpg_inst->assembly_list_head);
 
 	hdb_handle_put (&cpg_handle_t_db, *handle);
 
@@ -291,6 +310,25 @@ cs_error_t cpg_fd_get (
 	return (error);
 }
 
+cs_error_t cpg_max_atomic_msgsize_get (
+	cpg_handle_t handle,
+	uint32_t *size)
+{
+	cs_error_t error;
+	struct cpg_inst *cpg_inst;
+
+	error = hdb_error_to_cs (hdb_handle_get (&cpg_handle_t_db, handle, (void *)&cpg_inst));
+	if (error != CS_OK) {
+		return (error);
+	}
+
+	*size = cpg_inst->max_msg_size;
+
+	hdb_handle_put (&cpg_handle_t_db, handle);
+
+	return (error);
+}
+
 cs_error_t cpg_context_get (
 	cpg_handle_t handle,
 	void **context)
@@ -339,6 +377,7 @@ cs_error_t cpg_dispatch (
 	struct cpg_inst *cpg_inst;
 	struct res_lib_cpg_confchg_callback *res_cpg_confchg_callback;
 	struct res_lib_cpg_deliver_callback *res_cpg_deliver_callback;
+	struct res_lib_cpg_partial_deliver_callback *res_cpg_partial_deliver_callback;
 	struct res_lib_cpg_totem_confchg_callback *res_cpg_totem_confchg_callback;
 	struct cpg_inst cpg_inst_copy;
 	struct qb_ipc_response_header *dispatch_data;
@@ -346,6 +385,8 @@ cs_error_t cpg_dispatch (
 	struct cpg_address left_list[CPG_MEMBERS_MAX];
 	struct cpg_address joined_list[CPG_MEMBERS_MAX];
 	struct cpg_name group_name;
+	struct cpg_assembly_data *assembly_data;
+	struct qb_list_head *iter, *tmp_iter;
 	mar_cpg_address_t *left_list_start;
 	mar_cpg_address_t *joined_list_start;
 	unsigned int i;
@@ -361,7 +402,7 @@ cs_error_t cpg_dispatch (
 
 	/*
 	 * Timeout instantly for CS_DISPATCH_ONE_NONBLOCKING or CS_DISPATCH_ALL and
-	 * wait indefinately for CS_DISPATCH_ONE or CS_DISPATCH_BLOCKING
+	 * wait indefinitely for CS_DISPATCH_ONE or CS_DISPATCH_BLOCKING
 	 */
 	if (dispatch_types == CS_DISPATCH_ALL || dispatch_types == CS_DISPATCH_ONE_NONBLOCKING) {
 		timeout = 0;
@@ -428,6 +469,78 @@ cs_error_t cpg_dispatch (
 					res_cpg_deliver_callback->msglen);
 				break;
 
+			case MESSAGE_RES_CPG_PARTIAL_DELIVER_CALLBACK:
+				res_cpg_partial_deliver_callback = (struct res_lib_cpg_partial_deliver_callback *)dispatch_data;
+
+				marshall_from_mar_cpg_name_t (
+					&group_name,
+					&res_cpg_partial_deliver_callback->group_name);
+
+				/*
+				 * Search for assembly data for current messages (nodeid, pid) pair in list of assemblies
+				 */
+				assembly_data = NULL;
+				qb_list_for_each(iter, &(cpg_inst->assembly_list_head)) {
+					struct cpg_assembly_data *current_assembly_data = qb_list_entry (iter, struct cpg_assembly_data, list);
+					if (current_assembly_data->nodeid == res_cpg_partial_deliver_callback->nodeid && current_assembly_data->pid == res_cpg_partial_deliver_callback->pid) {
+						assembly_data = current_assembly_data;
+						break;
+					}
+				}
+
+				if (res_cpg_partial_deliver_callback->type == LIBCPG_PARTIAL_FIRST) {
+
+					/*
+					 * As this is LIBCPG_PARTIAL_FIRST packet, check that there is no ongoing assembly.
+					 * Otherwise the sending of packet must have been interrupted and error should have
+					 * been reported to sending client. Therefore here last assembly will be dropped.
+					 */
+					if (assembly_data) {
+						qb_list_del (&assembly_data->list);
+						free(assembly_data->assembly_buf);
+						free(assembly_data);
+						assembly_data = NULL;
+					}
+
+					assembly_data = malloc(sizeof(struct cpg_assembly_data));
+					if (!assembly_data) {
+						error = CS_ERR_NO_MEMORY;
+						goto error_put;
+					}
+
+					assembly_data->nodeid = res_cpg_partial_deliver_callback->nodeid;
+					assembly_data->pid = res_cpg_partial_deliver_callback->pid;
+					assembly_data->assembly_buf = malloc(res_cpg_partial_deliver_callback->msglen);
+					if (!assembly_data->assembly_buf) {
+						free(assembly_data);
+						error = CS_ERR_NO_MEMORY;
+						goto error_put;
+					}
+					assembly_data->assembly_buf_ptr = 0;
+					qb_list_init (&assembly_data->list);
+
+					qb_list_add (&assembly_data->list, &cpg_inst->assembly_list_head);
+				}
+				if (assembly_data) {
+					memcpy(assembly_data->assembly_buf + assembly_data->assembly_buf_ptr,
+						res_cpg_partial_deliver_callback->message, res_cpg_partial_deliver_callback->fraglen);
+					assembly_data->assembly_buf_ptr += res_cpg_partial_deliver_callback->fraglen;
+
+					if (res_cpg_partial_deliver_callback->type == LIBCPG_PARTIAL_LAST) {
+						cpg_inst_copy.model_v1_data.cpg_deliver_fn (handle,
+							&group_name,
+							res_cpg_partial_deliver_callback->nodeid,
+							res_cpg_partial_deliver_callback->pid,
+							assembly_data->assembly_buf,
+							res_cpg_partial_deliver_callback->msglen);
+
+						qb_list_del (&assembly_data->list);
+						free(assembly_data->assembly_buf);
+						free(assembly_data);
+					}
+				}
+				break;
+
 			case MESSAGE_RES_CPG_CONFCHG_CALLBACK:
 				if (cpg_inst_copy.model_v1_data.cpg_confchg_fn == NULL) {
 					break;
@@ -464,6 +577,21 @@ cs_error_t cpg_dispatch (
 					res_cpg_confchg_callback->left_list_entries,
 					joined_list,
 					res_cpg_confchg_callback->joined_list_entries);
+
+				/*
+				 * If member left while his partial packet was being assembled, assembly data must be removed from list
+				 */
+				for (i = 0; i < res_cpg_confchg_callback->left_list_entries; i++) {
+					qb_list_for_each_safe(iter, tmp_iter, &(cpg_inst->assembly_list_head)) {
+						struct cpg_assembly_data *current_assembly_data = qb_list_entry (iter, struct cpg_assembly_data, list);
+						if (current_assembly_data->nodeid != left_list[i].nodeid || current_assembly_data->pid != left_list[i].pid)
+							continue;
+
+						qb_list_del (&current_assembly_data->list);
+						free(current_assembly_data->assembly_buf);
+						free(current_assembly_data);
+					}
+				}
 
 				break;
 			case MESSAGE_RES_CPG_TOTEM_CONFCHG_CALLBACK:
@@ -799,6 +927,8 @@ retry_write:
 
 	res = close (fd);
 	if (res) {
+		munmap(addr, bytes);
+
 		return (-1);
 	}
 	*buf = addr;
@@ -855,13 +985,16 @@ cs_error_t cpg_zcb_alloc (
 		&res_coroipcs_zc_alloc,
 		sizeof (struct qb_ipc_response_header));
 
+	if (error != CS_OK) {
+		goto error_exit;
+	}
+
 	hdr = (struct coroipcs_zc_header *)buf;
 	hdr->map_size = map_size;
-	*buffer = ((char *)buf) + sizeof (struct coroipcs_zc_header);
+	*buffer = ((char *)buf) + sizeof (struct coroipcs_zc_header) + sizeof (struct req_lib_cpg_mcast);
 
+error_exit:
 	hdb_handle_put (&cpg_handle_t_db, handle);
-	*buffer = ((char *)*buffer) + sizeof (struct req_lib_cpg_mcast);
-
 	return (error);
 }
 
@@ -870,11 +1003,12 @@ cs_error_t cpg_zcb_free (
 	void *buffer)
 {
 	cs_error_t error;
+	unsigned int res;
 	struct cpg_inst *cpg_inst;
 	mar_req_coroipcc_zc_free_t req_coroipcc_zc_free;
 	struct qb_ipc_response_header res_coroipcs_zc_free;
 	struct iovec iovec;
-	struct coroipcs_zc_header *header = (struct coroipcs_zc_header *)((char *)buffer - sizeof (struct coroipcs_zc_header));
+	struct coroipcs_zc_header *header = (struct coroipcs_zc_header *)((char *)buffer - sizeof (struct coroipcs_zc_header) - sizeof (struct req_lib_cpg_mcast));
 
 	error = hdb_error_to_cs (hdb_handle_get (&cpg_handle_t_db, handle, (void *)&cpg_inst));
 	if (error != CS_OK) {
@@ -896,8 +1030,18 @@ cs_error_t cpg_zcb_free (
 		&res_coroipcs_zc_free,
 		sizeof (struct qb_ipc_response_header));
 
-	munmap ((void *)header, header->map_size);
+	if (error != CS_OK) {
+		goto error_exit;
+	}
 
+	res = munmap ((void *)header, header->map_size);
+	if (res == -1) {
+		error = qb_to_cs_error(-errno);
+
+		goto error_exit;
+	}
+
+error_exit:
 	hdb_handle_put (&cpg_handle_t_db, handle);
 
 	return (error);
@@ -921,6 +1065,12 @@ cs_error_t cpg_zcb_mcast_joined (
 	if (error != CS_OK) {
 		return (error);
 	}
+
+	if (msg_len > IPC_REQUEST_SIZE) {
+		error = CS_ERR_TOO_BIG;
+		goto error_exit;
+	}
+
 	req_lib_cpg_mcast = (struct req_lib_cpg_mcast *)(((char *)msg) - sizeof (struct req_lib_cpg_mcast));
 	req_lib_cpg_mcast->header.size = sizeof (struct req_lib_cpg_mcast) +
 		msg_len;
@@ -957,6 +1107,88 @@ error_exit:
 	return (error);
 }
 
+static cs_error_t send_fragments (
+	struct cpg_inst *cpg_inst,
+	cpg_guarantee_t guarantee,
+	size_t msg_len,
+	const struct iovec *iovec,
+	unsigned int iov_len)
+{
+	int i;
+	cs_error_t error = CS_OK;
+	struct iovec iov[2];
+	struct req_lib_cpg_partial_mcast req_lib_cpg_mcast;
+	struct res_lib_cpg_partial_send res_lib_cpg_partial_send;
+	size_t sent = 0;
+	size_t iov_sent = 0;
+	int retry_count;
+
+	req_lib_cpg_mcast.header.id = MESSAGE_REQ_CPG_PARTIAL_MCAST;
+	req_lib_cpg_mcast.guarantee = guarantee;
+	req_lib_cpg_mcast.msglen = msg_len;
+
+	iov[0].iov_base = (void *)&req_lib_cpg_mcast;
+	iov[0].iov_len = sizeof (struct req_lib_cpg_partial_mcast);
+
+	i=0;
+	iov_sent = 0 ;
+	qb_ipcc_fc_enable_max_set(cpg_inst->c,  2);
+
+	while (error == CS_OK && sent < msg_len) {
+
+		retry_count = 0;
+		if ( (iovec[i].iov_len - iov_sent) > cpg_inst->max_msg_size) {
+			iov[1].iov_len = cpg_inst->max_msg_size;
+		}
+		else {
+			iov[1].iov_len = iovec[i].iov_len - iov_sent;
+		}
+
+		if (sent == 0) {
+			req_lib_cpg_mcast.type = LIBCPG_PARTIAL_FIRST;
+		}
+		else if ((sent + iov[1].iov_len) == msg_len) {
+			req_lib_cpg_mcast.type = LIBCPG_PARTIAL_LAST;
+		}
+		else {
+			req_lib_cpg_mcast.type = LIBCPG_PARTIAL_CONTINUED;
+		}
+
+		req_lib_cpg_mcast.fraglen = iov[1].iov_len;
+		req_lib_cpg_mcast.header.size = sizeof (struct req_lib_cpg_partial_mcast) + iov[1].iov_len;
+		iov[1].iov_base = (char *)iovec[i].iov_base + iov_sent;
+
+	resend:
+		error = coroipcc_msg_send_reply_receive (cpg_inst->c, iov, 2,
+							 &res_lib_cpg_partial_send,
+							 sizeof (res_lib_cpg_partial_send));
+
+		if (error == CS_ERR_TRY_AGAIN) {
+			fprintf(stderr, "sleep. counter=%d\n", retry_count);
+			if (++retry_count > MAX_RETRIES) {
+				goto error_exit;
+			}
+			usleep(10000);
+			goto resend;
+		}
+
+		iov_sent += iov[1].iov_len;
+		sent += iov[1].iov_len;
+
+		/* Next iovec */
+		if (iov_sent >= iovec[i].iov_len) {
+			i++;
+			iov_sent = 0;
+		}
+		error = res_lib_cpg_partial_send.header.error;
+	}
+error_exit:
+	qb_ipcc_fc_enable_max_set(cpg_inst->c,  1);
+
+	return error;
+}
+
+
 cs_error_t cpg_mcast_joined (
 	cpg_handle_t handle,
 	cpg_guarantee_t guarantee,
@@ -979,6 +1211,11 @@ cs_error_t cpg_mcast_joined (
 		msg_len += iovec[i].iov_len;
 	}
 
+	if (msg_len > cpg_inst->max_msg_size) {
+		error = send_fragments(cpg_inst, guarantee, msg_len, iovec, iov_len);
+		goto error_exit;
+	}
+
 	req_lib_cpg_mcast.header.size = sizeof (struct req_lib_cpg_mcast) +
 		msg_len;
 
@@ -994,6 +1231,7 @@ cs_error_t cpg_mcast_joined (
 	error = qb_to_cs_error(qb_ipcc_sendv(cpg_inst->c, iov, iov_len + 1));
 	qb_ipcc_fc_enable_max_set(cpg_inst->c,  1);
 
+error_exit:
 	hdb_handle_put (&cpg_handle_t_db, handle);
 
 	return (error);
@@ -1049,7 +1287,7 @@ cs_error_t cpg_iteration_initialize(
 
 	cpg_iteration_instance->conn = cpg_inst->c;
 
-	list_init (&cpg_iteration_instance->list);
+	qb_list_init (&cpg_iteration_instance->list);
 
 	req_lib_cpg_iterationinitialize.header.size = sizeof (struct req_lib_cpg_iterationinitialize);
 	req_lib_cpg_iterationinitialize.header.id = MESSAGE_REQ_CPG_ITERATIONINITIALIZE;
@@ -1075,7 +1313,7 @@ cs_error_t cpg_iteration_initialize(
 		res_lib_cpg_iterationinitialize.iteration_handle;
 	cpg_iteration_instance->cpg_iteration_handle = *cpg_iteration_handle;
 
-	list_add (&cpg_iteration_instance->list, &cpg_inst->iteration_list_head);
+	qb_list_add (&cpg_iteration_instance->list, &cpg_inst->iteration_list_head);
 
 	hdb_handle_put (&cpg_iteration_handle_t_db, *cpg_iteration_handle);
 	hdb_handle_put (&cpg_handle_t_db, handle);

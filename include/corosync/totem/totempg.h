@@ -140,10 +140,14 @@ extern int totempg_groups_send_ok_groups (
 
 extern int totempg_ifaces_get (
 	unsigned int nodeid,
+	unsigned int *interface_id,
         struct totem_ip_address *interfaces,
         unsigned int interfaces_size,
 	char ***status,
         unsigned int *iface_count);
+
+extern int totempg_nodestatus_get (unsigned int nodeid,
+				   struct totem_node_status *node_status);
 
 extern void* totempg_get_stats (void);
 
@@ -157,10 +161,13 @@ extern int totempg_my_family_get (void);
 
 extern int totempg_crypto_set (const char *cipher_type, const char *hash_type);
 
-extern int totempg_ring_reenable (void);
-
 extern void totempg_service_ready_register (
 	void (*totem_service_ready) (void));
+
+extern int totempg_iface_set (
+	struct totem_ip_address *interface_addr,
+	unsigned short ip_port,
+	unsigned int iface_no);
 
 extern int totempg_member_add (
 	const struct totem_ip_address *member,
@@ -185,6 +192,16 @@ extern void totempg_queue_level_register_callback (totem_queue_level_changed_fn)
 extern void totempg_threaded_mode_enable (void);
 
 extern void totempg_trans_ack (void);
+
+extern int totempg_reconfigure (void);
+
+extern int totempg_crypto_reconfigure_phase (cfg_message_crypto_reconfig_phase_t phase);
+
+extern void totempg_force_gather (void);
+
+extern void totempg_get_config(struct totem_config *config);
+
+extern void totempg_put_config(struct totem_config *config);
 
 #ifdef __cplusplus
 }

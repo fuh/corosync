@@ -127,7 +127,7 @@ static int insert_into_buffer(
 }
 
 /*
- * format set is the only global specific option that
+ * format set is global specific option that
  * doesn't apply at system/subsystem level.
  */
 static int corosync_main_config_format_set (
@@ -137,6 +137,7 @@ static int corosync_main_config_format_set (
 	char new_format_buffer[PATH_MAX];
 	char *value = NULL;
 	int err = 0;
+	char timestamp_str_to_add[8];
 
 	if (map_get_string("logging.fileline", &value) == CS_OK) {
 		if (strcmp (value, "on") == 0) {
@@ -196,15 +197,16 @@ static int corosync_main_config_format_set (
 		goto parse_error;
 	}
 
+	memset(timestamp_str_to_add, 0, sizeof(timestamp_str_to_add));
+
 	if (map_get_string("logging.timestamp", &value) == CS_OK) {
 		if (strcmp (value, "on") == 0) {
-			if(!insert_into_buffer(new_format_buffer,
-					sizeof(new_format_buffer),
-					"%t ", NULL)) {
-				err = logsys_format_set(new_format_buffer);
-			}
-		} else
-		if (strcmp (value, "off") == 0) {
+			strcpy(timestamp_str_to_add, "%t");
+#ifdef QB_FEATURE_LOG_HIRES_TIMESTAMPS
+		} else if (strcmp (value, "hires") == 0) {
+			strcpy(timestamp_str_to_add, "%T");
+#endif
+		} else if (strcmp (value, "off") == 0) {
 			/* nothing to do here */
 		} else {
 			error_reason = "unknown value for timestamp";
@@ -213,11 +215,62 @@ static int corosync_main_config_format_set (
 		}
 
 		free(value);
+	} else {
+		/*
+		 * Display hires timestamp by default, otherwise standard timestamp
+		 */
+#ifdef QB_FEATURE_LOG_HIRES_TIMESTAMPS
+		strcpy(timestamp_str_to_add, "%T");
+#else
+		strcpy(timestamp_str_to_add, "%t");
+#endif
+	}
+
+	if(strcmp(timestamp_str_to_add, "") != 0) {
+		strcat(timestamp_str_to_add, " ");
+		if (insert_into_buffer(new_format_buffer, sizeof(new_format_buffer),
+		    timestamp_str_to_add, NULL) == 0) {
+			err = logsys_format_set(new_format_buffer);
+		}
 	}
 
 	if (err) {
 		error_reason = "not enough memory to set logging format buffer";
 		goto parse_error;
+	}
+
+	return (0);
+
+parse_error:
+	*error_string = error_reason;
+
+	return (-1);
+}
+
+/*
+ * blackbox is another global specific option that
+ * doesn't apply at system/subsystem level.
+ */
+static int corosync_main_config_blackbox_set (
+	const char **error_string)
+{
+	const char *error_reason;
+	char *value = NULL;
+
+	if (map_get_string("logging.blackbox", &value) == CS_OK) {
+		if (strcmp (value, "on") == 0) {
+			(void)logsys_blackbox_set(QB_TRUE);
+		} else if (strcmp (value, "off") == 0) {
+			(void)logsys_blackbox_set(QB_FALSE);
+		} else {
+			error_reason = "unknown value for blackbox";
+			free(value);
+			goto parse_error;
+		}
+
+		free(value);
+	} else {
+		(void)logsys_blackbox_set(QB_TRUE);
 	}
 
 	return (0);
@@ -235,6 +288,7 @@ static int corosync_main_config_log_destination_set (
 	const char **error_string,
 	unsigned int mode_mask,
 	char deprecated,
+	char default_value,
 	const char *replacement)
 {
 	static char formatted_error_reason[128];
@@ -246,7 +300,7 @@ static int corosync_main_config_log_destination_set (
 	if (map_get_string(key_name, &value) == CS_OK) {
 		if (deprecated) {
 			log_printf(LOGSYS_LEVEL_WARNING,
-			 "Warning: the %s config paramater has been obsoleted."
+			 "Warning: the %s config parameter has been obsoleted."
 			 " See corosync.conf man page %s directive.",
 			 key, replacement);
 		}
@@ -268,6 +322,21 @@ static int corosync_main_config_log_destination_set (
 			}
 		} else {
 			sprintf (formatted_error_reason, "unknown value for %s", key);
+			goto parse_error;
+		}
+	}
+	/* Set to default if we are the top-level logger */
+	else if (!subsys && !deprecated) {
+
+		mode = logsys_config_mode_get (subsys);
+		if (default_value) {
+			mode |= mode_mask;
+		}
+		else {
+			mode &= ~mode_mask;
+		}
+		if (logsys_config_mode_set(subsys, mode) < 0) {
+			sprintf (formatted_error_reason, "unable to change mode %s", key);
 			goto parse_error;
 		}
 	}
@@ -314,11 +383,11 @@ static int corosync_main_config_set (
 	}
 
 	if (corosync_main_config_log_destination_set (path, "to_stderr", subsys, &error_reason,
-	    LOGSYS_MODE_OUTPUT_STDERR, 0, NULL) != 0)
+	    LOGSYS_MODE_OUTPUT_STDERR, 0, 1, NULL) != 0)
 		goto parse_error;
 
 	if (corosync_main_config_log_destination_set (path, "to_syslog", subsys, &error_reason,
-	    LOGSYS_MODE_OUTPUT_SYSLOG, 0, NULL) != 0)
+	    LOGSYS_MODE_OUTPUT_SYSLOG, 0, 1, NULL) != 0)
 		goto parse_error;
 
 	snprintf(key_name, MAP_KEYNAME_MAXLEN, "%s.%s", path, "syslog_facility");
@@ -338,13 +407,21 @@ static int corosync_main_config_set (
 
 		free(value);
 	}
+	else {
+		/* Set default here in case of a reload */
+		if (logsys_config_syslog_facility_set(subsys,
+						      qb_log_facility2int("daemon")) < 0) {
+			error_reason = "unable to set syslog facility";
+			goto parse_error;
+		}
+	}
 
 	snprintf(key_name, MAP_KEYNAME_MAXLEN, "%s.%s", path, "syslog_level");
 	if (map_get_string(key_name, &value) == CS_OK) {
 		int syslog_priority;
 
 		log_printf(LOGSYS_LEVEL_WARNING,
-		 "Warning: the syslog_level config paramater has been obsoleted."
+		 "Warning: the syslog_level config parameter has been obsoleted."
 		 " See corosync.conf man page syslog_priority directive.");
 
 		syslog_priority = logsys_priority_id_get(value);
@@ -377,6 +454,13 @@ static int corosync_main_config_set (
 			goto parse_error;
 		}
 	}
+	else if(strcmp(key_name, "logging.syslog_priority") == 0){
+		if (logsys_config_syslog_priority_set(subsys,
+						      logsys_priority_id_get("info")) < 0) {
+			error_reason = "unable to set syslog level";
+			goto parse_error;
+		}
+	}
 
 #ifdef LOGCONFIG_USE_ICMAP
 	snprintf(key_name, MAP_KEYNAME_MAXLEN, "%s.%s", path, "logfile");
@@ -395,11 +479,11 @@ static int corosync_main_config_set (
 #endif
 
 	if (corosync_main_config_log_destination_set (path, "to_file", subsys, &error_reason,
-	    LOGSYS_MODE_OUTPUT_FILE, 1, "to_logfile") != 0)
+	   LOGSYS_MODE_OUTPUT_FILE, 1, 0, "to_logfile") != 0)
 		goto parse_error;
 
 	if (corosync_main_config_log_destination_set (path, "to_logfile", subsys, &error_reason,
-	    LOGSYS_MODE_OUTPUT_FILE, 0, NULL) != 0)
+	   LOGSYS_MODE_OUTPUT_FILE, 0, 0, NULL) != 0)
 		goto parse_error;
 
 	snprintf(key_name, MAP_KEYNAME_MAXLEN, "%s.%s", path, "logfile_priority");
@@ -415,6 +499,13 @@ static int corosync_main_config_set (
 		if (logsys_config_logfile_priority_set(subsys,
 						logfile_priority) < 0) {
 			error_reason = "unable to set logfile priority";
+			goto parse_error;
+		}
+	}
+	else if(strcmp(key_name,"logging.logfile_priority") == 0){
+		if (logsys_config_logfile_priority_set(subsys,
+						      logsys_priority_id_get("info")) < 0) {
+			error_reason = "unable to set syslog level";
 			goto parse_error;
 		}
 	}
@@ -448,6 +539,12 @@ static int corosync_main_config_set (
 		}
 		free(value);
 	}
+	else {
+		if (logsys_config_debug_set (subsys, LOGSYS_DEBUG_OFF) < 0) {
+			error_reason = "unable to set debug off";
+			goto parse_error;
+		}
+	}
 
 	return (0);
 
@@ -477,6 +574,10 @@ static int corosync_main_config_read_logging (
 		goto parse_error;
 	}
 
+	if (corosync_main_config_blackbox_set(&error_reason) < 0) {
+		goto parse_error;
+	}
+
 	if (corosync_main_config_set ("logging", NULL, &error_reason) < 0) {
 		goto parse_error;
 	}
@@ -502,7 +603,14 @@ static int corosync_main_config_read_logging (
 			continue ;
 		}
 
-		snprintf(key_item, MAP_KEYNAME_MAXLEN, "logging.logger_subsys.%s", key_subsys);
+		if (snprintf(key_item, MAP_KEYNAME_MAXLEN, "logging.logger_subsys.%s",
+		    key_subsys) >= MAP_KEYNAME_MAXLEN) {
+			/*
+			 * This should never happen
+			 */
+			error_reason = "Can't snprintf logger_subsys key_item";
+			goto parse_error;
+		}
 
 		if (corosync_main_config_set(key_item, key_subsys, &error_reason) < 0) {
 			goto parse_error;

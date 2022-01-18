@@ -9,9 +9,11 @@ logsysrec
 ploadstart
 stress_cpgcontext
 stress_cpgfdget
+testcfg
 testcpg
 testcpg2
 testquorum
+testquorummodel
 testsam
 testvotequorum1
 testvotequorum2
@@ -19,3 +21,4 @@ cpgbenchzc
 stress_cpgzc
 testcpgzc
 testzcgc
+cpghum

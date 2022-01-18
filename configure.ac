@@ -5,12 +5,12 @@
 AC_PREREQ([2.61])
 
 AC_INIT([corosync],
-	m4_esyscmd([build-aux/git-version-gen .tarball-version]),
-	[discuss@lists.corosync.org])
+	m4_esyscmd([build-aux/git-version-gen .tarball-version .gitarchivever]),
+	[users@clusterlabs.org])
 
 AC_USE_SYSTEM_EXTENSIONS
 
-AM_INIT_AUTOMAKE([-Wno-portability])
+AM_INIT_AUTOMAKE([foreign 1.11])
 
 LT_PREREQ([2.2.6])
 LT_INIT
@@ -34,7 +34,7 @@ AC_ARG_ENABLE(interlib-deps,
     [enable_interlib_deps="yes"])
 
 AC_MSG_NOTICE([enable inter-library dependencies: $enable_interlib_deps])
-if test "${enable_interlib_deps}" == "yes"; then
+if test "x${enable_interlib_deps}" = "xyes"; then
     link_all_deplibs=yes
     link_all_deplibs_CXX=yes
 else
@@ -43,6 +43,8 @@ else
 fi
 
 dnl Fix default variables - "prefix" variable if not specified
+systemddir=${prefix}/lib/systemd/system
+
 if test "$prefix" = "NONE"; then
 	prefix="/usr"
 
@@ -54,6 +56,9 @@ if test "$prefix" = "NONE"; then
 	if test "$sysconfdir" = "\${prefix}/etc"; then
 		sysconfdir="/etc"
 	fi
+	if test "$systemddir" = "NONE/lib/systemd/system"; then
+		systemddir=/lib/systemd/system
+	fi
 	dnl Fix "libdir" variable if not specified
 	if test "$libdir" = "\${exec_prefix}/lib"; then
 		if test -e /usr/lib64; then
@@ -64,12 +69,12 @@ if test "$prefix" = "NONE"; then
 	fi
 fi
 
-if test "$srcdir" = "."; then
-	AC_MSG_NOTICE([building in place srcdir:$srcdir])
-	AC_DEFINE([BUILDING_IN_PLACE], 1, [building in place])
-else
-	AC_MSG_NOTICE([building out of tree srcdir:$srcdir])
-fi
+AC_MSG_NOTICE(Sanitizing exec_prefix: ${exec_prefix})
+case $exec_prefix in
+  dnl For consistency with Corosync, map NONE->$prefix
+  NONE)   exec_prefix=$prefix;;
+  prefix) exec_prefix=$prefix;;
+esac
 
 # Checks for programs.
 
@@ -78,24 +83,24 @@ if ! ${MAKE-make} --version /cannot/make/this >/dev/null 2>&1; then
 	AC_MSG_ERROR([you don't seem to have GNU make; it is required])
 fi
 
-sinclude(coroysync-default.m4)
+sinclude(corosync-default.m4)
 
 AC_PROG_CC
-AC_PROG_CXX
+AC_PROG_CC_C99
+if test "x$ac_cv_prog_cc_c99" = "xno"; then
+	AC_MSG_ERROR(["C99 support is required"])
+fi
 AC_PROG_INSTALL
 AC_PROG_LN_S
 AC_PROG_MAKE_SET
-AC_PROG_RANLIB
 AC_PROG_SED
-AC_PROG_LIBTOOL
+PKG_PROG_PKG_CONFIG
 
 AC_CHECK_PROGS([GROFF], [groff])
-AC_CHECK_PROGS([PKGCONFIG], [pkg-config])
 AC_CHECK_PROGS([AUGTOOL], [augtool])
 AC_CHECK_PROGS([DOT], [dot])
 AC_CHECK_PROGS([DOXYGEN], [doxygen])
 AC_CHECK_PROGS([AWK], [awk])
-AC_CHECK_PROGS([SED], [sed])
 AC_PATH_PROG([BASHPATH], [bash])
 
 # Checks for compiler characteristics.
@@ -148,21 +153,50 @@ AC_TYPE_UINT64_T
 AC_TYPE_UINT8_T
 AC_TYPE_SIZE_T
 AC_TYPE_SSIZE_T
-AC_TYPE_SIGNAL
 
 # Checks for libraries.
-PKG_CHECK_MODULES([nss],[nss])
+SAVE_CPPFLAGS="$CPPFLAGS"
+SAVE_LIBS="$LIBS"
 PKG_CHECK_MODULES([LIBQB], [libqb])
+CPPFLAGS="$CPPFLAGS $LIBQB_CFLAGS"
+LIBS="$LIBS $LIBQB_LIBS"
 AC_CHECK_LIB([qb], [qb_log_thread_priority_set], \
 	     have_qb_log_thread_priority_set="yes", \
 	     have_qb_log_thread_priority_set="no")
 if test "x${have_qb_log_thread_priority_set}" = xyes; then
 	AC_DEFINE_UNQUOTED([HAVE_QB_LOG_THREAD_PRIORITY_SET], 1, [have qb_log_thread_priority_set])
 fi
+AC_CHECK_LIB([qb], [qb_log_file_reopen], \
+	     have_qb_log_file_reopen="yes", \
+	     have_qb_log_file_reopen="no")
+if test "x${have_qb_log_file_reopen}" = xyes; then
+	AC_DEFINE_UNQUOTED([HAVE_QB_LOG_FILE_REOPEN], 1, [have qb_log_file_reopen])
+fi
+AM_CONDITIONAL(HAVE_QB_LOG_FILE_REOPEN, test x$have_qb_log_file_reopen = xyes)
+
+CPPFLAGS="$SAVE_CPPFLAGS"
+LIBS="$SAVE_LIBS"
 AC_CHECK_LIB([pthread], [pthread_create])
 AC_CHECK_LIB([socket], [socket])
+PKG_CHECK_MODULES([knet],[libknet])
 AC_CHECK_LIB([nsl], [t_open])
 AC_CHECK_LIB([rt], [sched_getscheduler])
+AC_CHECK_LIB([z], [crc32],
+    AM_CONDITIONAL([HAVE_CRC32], true),
+    AM_CONDITIONAL([HAVE_CRC32], false))
+
+# this hack is necessary to check for symbols on out of tree builds
+# but it is as horrible as it gets and in theory users should be
+# invoking ./configure with proper LIBRARY_PATH set.
+OLDLIBS="$LIBS"
+LIBS="$knet_LIBS $LIBS"
+AC_CHECK_LIB([knet],[knet_handle_enable_access_lists],
+	     [AC_DEFINE_UNQUOTED([HAVE_KNET_ACCESS_LIST], 1, [have knet access list])])
+AC_CHECK_LIB([knet],[knet_handle_crypto_set_config],
+	     [AC_DEFINE_UNQUOTED([HAVE_KNET_CRYPTO_RECONF], 1, [have knet crypto reconfig support])])
+AC_CHECK_LIB([knet],[knet_handle_get_onwire_ver],
+	     [AC_DEFINE_UNQUOTED([HAVE_KNET_ONWIRE_VER], 1, [have knet onwire versioning])])
+LIBS="$OLDLIBS"
 
 # Checks for library functions.
 AC_FUNC_ALLOCA
@@ -176,10 +210,10 @@ AC_FUNC_REALLOC
 AC_FUNC_SELECT_ARGTYPES
 AC_FUNC_VPRINTF
 
-AC_CHECK_FUNCS([alarm alphasort atexit bzero dup2 endgrent endpwent fcntl \
-		getcwd getpeerucred getpeereid gettimeofday inet_ntoa memmove \
-		memset mkdir scandir select socket strcasecmp strchr strdup \
-		strerror strrchr strspn strstr pthread_setschedparam \
+AC_CHECK_FUNCS([alarm alphasort atexit bzero dup2 endgrent endpwent fdatasync \
+		fcntl getcwd getpeerucred getpeereid gettimeofday inet_ntoa \
+		memmove memset mkdir scandir select socket strcasecmp strchr \
+		strdup strerror strrchr strspn strstr pthread_setschedparam \
 		sched_get_priority_max sched_setscheduler getifaddrs \
 		clock_gettime ftruncate gethostname localtime_r munmap strtol])
 
@@ -192,13 +226,11 @@ AC_CONFIG_FILES([Makefile
 		 man/Makefile
 		 pkgconfig/Makefile
 		 test/Makefile
-		 cts/Makefile
-		 cts/agents/Makefile
-		 cts/CTSvars.py
 		 tools/Makefile
 		 conf/Makefile
-		 qdevices/Makefile
-		 Doxyfile])
+		 vqsim/Makefile
+		 Doxyfile
+		 conf/logrotate/Makefile])
 
 ### Local business
 
@@ -235,30 +267,26 @@ LIB_MSG_RESULT(m4_shift(m4_shift($@)))dnl
 # Helpers
 # ===============================================
 
+## check if the compiler supports -Werror -Wunknown-warning-option
+AC_MSG_CHECKING([whether $CC supports -Wunknown-warning-option -Werror])
+BACKUP="$CPPFLAGS"
+CPPFLAGS="$CPPFLAGS -Werror -Wunknown-warning-option"
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM([])],
+		  [unknown_warnings_as_errors='-Wunknown-warning-option -Werror'; AC_MSG_RESULT([yes])],
+		  [unknown_warnings_as_errors=''; AC_MSG_RESULT([no])])
+CPPFLAGS="$BACKUP"
+
 ## helper for CC stuff
 cc_supports_flag() {
 	BACKUP="$CPPFLAGS"
-	CPPFLAGS="$CPPFLAGS $@"
+	CPPFLAGS="$CPPFLAGS $@ $unknown_warnings_as_errors"
 	AC_MSG_CHECKING([whether $CC supports "$@"])
-	AC_PREPROC_IFELSE([AC_LANG_PROGRAM([])],
+	AC_COMPILE_IFELSE([AC_LANG_PROGRAM([])],
 			  [RC=0; AC_MSG_RESULT([yes])],
 			  [RC=1; AC_MSG_RESULT([no])])
 	CPPFLAGS="$BACKUP"
 	return $RC
 }
-
-## cleanup
-AC_MSG_NOTICE(Sanitizing prefix: ${prefix})
-case $prefix in
-  NONE) prefix=/usr/local;;
-esac
-
-AC_MSG_NOTICE(Sanitizing exec_prefix: ${exec_prefix})
-case $exec_prefix in
-  dnl For consistency with Corosync, map NONE->$prefix
-  NONE)   exec_prefix=$prefix;;
-  prefix) exec_prefix=$prefix;;
-esac
 
 ## local defines
 PACKAGE_FEATURES=""
@@ -293,6 +321,12 @@ AC_ARG_ENABLE([debug],
 	[  --enable-debug                  : enable debug build. ],
 	[ default="no" ])
 
+AC_ARG_WITH([sanitizers],
+	[AS_HELP_STRING([--with-sanitizers=...,...],
+			[enable SANitizer build, do *NOT* use for production. Only ASAN/UBSAN/TSAN are currently supported])],
+	[ SANITIZERS="$withval" ],
+	[ SANITIZERS="" ])
+
 AC_ARG_ENABLE([secure-build],
 	[  --enable-secure-build           : enable PIE/RELRO build. ],
 	[],
@@ -314,15 +348,6 @@ AC_ARG_ENABLE([dbus],
 	[  --enable-dbus                   : dbus events. ],,
 	[ enable_dbus="no" ])
 
-AC_ARG_ENABLE([testagents],
-	[  --enable-testagents             : Install Test Agents. ],,
-	[ default="no" ])
-
-AC_ARG_ENABLE([rdma],
-	[  --enable-rdma                   : Infiniband RDMA transport support ],,
-	[ enable_rdma="no" ])
-AM_CONDITIONAL(BUILD_RDMA, test x$enable_rdma = xyes)
-
 AC_ARG_ENABLE([monitoring],
 	[  --enable-monitoring             : resource monitoring ],,
 	[ default="no" ])
@@ -343,10 +368,12 @@ AC_ARG_ENABLE([systemd],
 	[ enable_systemd="no" ])
 AM_CONDITIONAL(INSTALL_SYSTEMD, test x$enable_systemd = xyes)
 
-AC_ARG_ENABLE([upstart],
-	      [  --enable-upstart                : Install upstart service files],,
-	[ enable_upstart="no" ])
-AM_CONDITIONAL(INSTALL_UPSTART, test x$enable_upstart = xyes)
+AC_ARG_WITH([initconfigdir],
+	[AS_HELP_STRING([--with-initconfigdir=DIR],
+		[configuration directory @<:@SYSCONFDIR/sysconfig@:>@])],
+	[INITCONFIGDIR="$withval"],
+	[INITCONFIGDIR='${sysconfdir}/sysconfig'])
+AC_SUBST([INITCONFIGDIR])
 
 AC_ARG_WITH([initddir],
 	[  --with-initddir=DIR     : path to init script directory. ],
@@ -356,17 +383,17 @@ AC_ARG_WITH([initddir],
 AC_ARG_WITH([systemddir],
 	[  --with-systemddir=DIR   : path to systemd unit files directory. ],
 	[ SYSTEMDDIR="$withval" ],
-	[ SYSTEMDDIR="/lib/systemd/system" ])
+	[ SYSTEMDDIR="$systemddir" ])
 
-AC_ARG_WITH([upstartdir],
-	[  --with-upstartdir=DIR   : path to upstart config files directory. ],
-	[ UPSTARTDIR="$withval" ],
-	[ UPSTARTDIR="$sysconfdir/init" ])
+AC_ARG_WITH([logdir],
+	[  --with-logdir=DIR       : the base directory for corosync logging files. ],
+	[ LOGDIR="$withval" ],
+	[ LOGDIR="$localstatedir/log/cluster" ])
 
-AC_ARG_WITH([initwrappersdir],
-	[  --with-initwrappersdir=DIR   : path to init wrappers files directory. ],
-	[ INITWRAPPERSDIR="$withval" ],
-	[ INITWRAPPERSDIR="$datarootdir/corosync" ])
+AC_ARG_WITH([logrotatedir],
+	[  --with-logrotatedir=DIR : the base directory for logrorate.d files.  ],
+	[ LOGROTATEDIR="$withval" ],
+	[ LOGROTATEDIR="$sysconfdir/logrotate.d" ])
 
 AC_ARG_ENABLE([snmp],
 	[  --enable-snmp                   : SNMP protocol support ],
@@ -377,10 +404,14 @@ AC_ARG_ENABLE([xmlconf],
 	[ enable_xmlconf="no" ])
 AM_CONDITIONAL(INSTALL_XMLCONF, test x$enable_xmlconf = xyes)
 
-AC_ARG_ENABLE([qdevices],
-	[  --enable-qdevices               : Quorum devices support ],,
-	[ enable_qdevices="no" ])
-AM_CONDITIONAL(BUILD_QDEVICES, test x$enable_qdevices = xyes)
+AC_ARG_ENABLE([vqsim],
+	[  --enable-vqsim                  : Quorum simulator support ],,
+	[ enable_vqsim="no" ])
+AM_CONDITIONAL(BUILD_VQSIM, test x$enable_vqsim = xyes)
+
+AC_ARG_ENABLE([nozzle],
+	[  --enable-nozzle                 : Support for nozzle ],,
+	[ enable_nozzle="no" ])
 
 # *FLAGS handling goes here
 
@@ -404,26 +435,42 @@ else
 	GDB_FLAGS="-g"
 fi
 
+# --- ASAN/UBSAN/TSAN (see man gcc) ---
+# when using SANitizers, we need to pass the -fsanitize..
+# to both CFLAGS and LDFLAGS. The CFLAGS/LDFLAGS must be
+# specified as first in the list or there will be runtime
+# issues (for example user has to LD_PRELOAD asan for it to work
+# properly).
+
+if test -n "${SANITIZERS}"; then
+	SANITIZERS=$(echo $SANITIZERS | sed -e 's/,/ /g')
+	for SANITIZER in $SANITIZERS; do
+		case $SANITIZER in
+			asan|ASAN)
+				SANITIZERS_CFLAGS="$SANITIZERS_CFLAGS -fsanitize=address"
+				SANITIZERS_LDFLAGS="$SANITIZERS_LDFLAGS -fsanitize=address -lasan"
+				AC_CHECK_LIB([asan],[main],,AC_MSG_ERROR([Unable to find libasan]))
+				;;
+			ubsan|UBSAN)
+				SANITIZERS_CFLAGS="$SANITIZERS_CFLAGS -fsanitize=undefined"
+				SANITIZERS_LDFLAGS="$SANITIZERS_LDFLAGS -fsanitize=undefined -lubsan"
+				AC_CHECK_LIB([ubsan],[main],,AC_MSG_ERROR([Unable to find libubsan]))
+				;;
+			tsan|TSAN)
+				SANITIZERS_CFLAGS="$SANITIZERS_CFLAGS -fsanitize=thread"
+				SANITIZERS_LDFLAGS="$SANITIZERS_LDFLAGS -fsanitize=thread -ltsan"
+				AC_CHECK_LIB([tsan],[main],,AC_MSG_ERROR([Unable to find libtsan]))
+				;;
+		esac
+	done
+fi
+
 # Look for dbus-1
 if test "x${enable_dbus}" = xyes; then
 	PKG_CHECK_MODULES([DBUS],[dbus-1])
 	AC_DEFINE_UNQUOTED([HAVE_DBUS], 1, [have dbus])
 	PACKAGE_FEATURES="$PACKAGE_FEATURES dbus"
 	WITH_LIST="$WITH_LIST --with dbus"
-fi
-
-if test "x${enable_testagents}" = xyes; then
-	AC_DEFINE_UNQUOTED([HAVE_TESTAGENTS], 1, [have testagents])
-	PACKAGE_FEATURES="$PACKAGE_FEATURES testagents"
-	WITH_LIST="$WITH_LIST --with testagents"
-fi
-
-if test "x${enable_rdma}" = xyes; then
-	PKG_CHECK_MODULES([rdmacm],[rdmacm])
-	PKG_CHECK_MODULES([ibverbs],[ibverbs])
-	AC_DEFINE_UNQUOTED([HAVE_RDMA], 1, [have rdmacm])
-	PACKAGE_FEATURES="$PACKAGE_FEATURES rdma"
-	WITH_LIST="$WITH_LIST --with rdma"
 fi
 
 if test "x${enable_monitoring}" = xyes; then
@@ -448,19 +495,31 @@ if test "x${enable_augeas}" = xyes; then
 	PACKAGE_FEATURES="$PACKAGE_FEATURES augeas"
 fi
 if test "x${enable_systemd}" = xyes; then
+	PKG_CHECK_MODULES([libsystemd], [libsystemd])
+	AC_DEFINE([HAVE_LIBSYSTEMD], [1], [have systemd interface library])
 	PACKAGE_FEATURES="$PACKAGE_FEATURES systemd"
 	WITH_LIST="$WITH_LIST --with systemd"
-fi
-if test "x${enable_upstart}" = xyes; then
-	PACKAGE_FEATURES="$PACKAGE_FEATURES upstart"
-	WITH_LIST="$WITH_LIST --with upstart"
 fi
 if test "x${enable_xmlconf}" = xyes; then
 	PACKAGE_FEATURES="$PACKAGE_FEATURES xmlconf"
 	WITH_LIST="$WITH_LIST --with xmlconf"
 fi
-if test "x${enable_qdevices}" = xyes; then
-	PACKAGE_FEATURES="$PACKAGE_FEATURES qdevices"
+if test "x${enable_vqsim}" = xyes; then
+	vqsim_readline=no
+	AC_CHECK_HEADERS([readline/readline.h readline/history.h],
+			 [],
+                         AC_MSG_WARN([vqsim will lack readline support]))
+	PACKAGE_FEATURES="$PACKAGE_FEATURES vqsim"
+	WITH_LIST="$WITH_LIST --with vqsim"
+fi
+AM_CONDITIONAL(VQSIM_READLINE, [test "x${ac_cv_header_readline_readline_h}" = xyes])
+
+# Look for nozzle
+if test "x${enable_nozzle}" = xyes; then
+	PKG_CHECK_MODULES([nozzle],[libnozzle])
+	AC_DEFINE_UNQUOTED([HAVE_LIBNOZZLE], 1, [have nozzle])
+	PACKAGE_FEATURES="$PACKAGE_FEATURES nozzle"
+	WITH_LIST="$WITH_LIST --with nozzle"
 fi
 
 do_snmp=0
@@ -519,7 +578,6 @@ WARNLIST="
 	missing-prototypes
 	missing-declarations
 	strict-prototypes
-	declaration-after-statement
 	pointer-arith
 	write-strings
 	cast-align
@@ -530,7 +588,6 @@ WARNLIST="
 	format-nonliteral
 	no-long-long
 	unsigned-char
-	gnu89-inline
 	no-strict-aliasing
 	"
 
@@ -655,12 +712,12 @@ INCLUDE_DIRS="$INCLUDE_DIRS -I\$(top_builddir)/include -I\$(top_srcdir)/include"
 INCLUDE_DIRS="$INCLUDE_DIRS -I\$(top_builddir)/include/corosync -I\$(top_srcdir)/include/corosync"
 
 # final build of *FLAGS
-CFLAGS="$ENV_CFLAGS $lt_prog_compiler_pic $SEC_FLAGS $OPT_CFLAGS $GDB_FLAGS \
+CFLAGS="$SANITIZERS_CFLAGS $ENV_CFLAGS $lt_prog_compiler_pic $SEC_FLAGS $OPT_CFLAGS $GDB_FLAGS \
 	$COVERAGE_CFLAGS $EXTRA_WARNINGS \
-	$WERROR_CFLAGS $NSS_CFLAGS $LIBQB_CFLAGS \
+	$WERROR_CFLAGS $LIBQB_CFLAGS \
 	$SNMP_INCLUDES"
 CPPFLAGS="$ENV_CPPFLAGS $ANSI_CPPFLAGS $INCLUDE_DIRS"
-LDFLAGS="$ENV_LDFLAGS $lt_prog_compiler_pic $SEC_LDFLAGS $COVERAGE_LDFLAGS"
+LDFLAGS="$SANITIZERS_LDFLAGS $ENV_LDFLAGS $lt_prog_compiler_pic $SEC_LDFLAGS $COVERAGE_LDFLAGS"
 
 if test "$ap_cv_cc_as_needed" = "yes"; then
   LDFLAGS="$LDFLAGS -Wl,--as-needed"
@@ -670,20 +727,17 @@ fi
 AC_SUBST([BASHPATH])
 AC_SUBST([INITDDIR])
 AC_SUBST([SYSTEMDDIR])
-AC_SUBST([UPSTARTDIR])
-INITWRAPPERSDIR=$(eval echo ${INITWRAPPERSDIR})
-AC_SUBST([INITWRAPPERSDIR])
+AC_SUBST([LOGDIR])
+AC_SUBST([LOGROTATEDIR])
 
 AC_SUBST([SOMAJOR])
 AC_SUBST([SOMINOR])
 AC_SUBST([SOMICRO])
 AC_SUBST([SONAME])
 
-AM_CONDITIONAL(INSTALL_TESTAGENTS, test "${enable_testagents}" = "yes")
 AM_CONDITIONAL(INSTALL_MIB, test "${do_snmp}" = "1")
 AM_CONDITIONAL(INSTALL_DBUSCONF, test "${enable_dbus}" = "yes")
 AM_CONDITIONAL(AUGTOOL, test -n "${AUGTOOL}")
-AC_SUBST([NSS_LDFLAGS])
 
 AM_CONDITIONAL(BUILD_HTML_DOCS, test -n "${GROFF}")
 
@@ -713,16 +767,17 @@ AC_MSG_RESULT([  State information        = ${localstatedir}])
 AC_MSG_RESULT([  System configuration     = ${sysconfdir}])
 AC_MSG_RESULT([  System init.d directory  = ${INITDDIR}])
 AC_MSG_RESULT([  System systemd directory = ${SYSTEMDDIR}])
-AC_MSG_RESULT([  System upstart directory = ${UPSTARTDIR}])
-AC_MSG_RESULT([  System init wraps dir    = ${INITWRAPPERSDIR}])
+AC_MSG_RESULT([  Log directory            = ${LOGDIR}])
+AC_MSG_RESULT([  Log rotate directory     = ${LOGROTATEDIR}])
 AC_MSG_RESULT([  corosync config dir      = ${COROSYSCONFDIR}])
+AC_MSG_RESULT([  init config directory    = ${INITCONFIGDIR}])
 AC_MSG_RESULT([  Features                 =${PACKAGE_FEATURES}])
 AC_MSG_RESULT([])
 AC_MSG_RESULT([$PACKAGE build info:])
 AC_MSG_RESULT([  Library SONAME           = ${SONAME}])
 LIB_MSG_RESULT(m4_shift(local_soname_list))dnl
 AC_MSG_RESULT([  Default optimization     = ${OPT_CFLAGS}])
-AC_MSG_RESULT([  Default debug options    = ${GDB_CFLAGS}])
+AC_MSG_RESULT([  Default debug options    = ${GDB_FLAGS}])
 AC_MSG_RESULT([  Extra compiler warnings  = ${EXTRA_WARNING}])
 AC_MSG_RESULT([  Env. defined CFLAG       = ${ENV_CFLAGS}])
 AC_MSG_RESULT([  Env. defined CPPFLAGS    = ${ENV_CPPFLAGS}])

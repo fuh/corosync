@@ -53,7 +53,7 @@ int totemsrp_initialize (
 	qb_loop_t *poll_handle,
 	void **srp_context,
 	struct totem_config *totem_config,
-	totemmrp_stats_t *stats,
+	totempg_stats_t *stats,
 
 	void (*deliver_fn) (
 		unsigned int nodeid,
@@ -101,9 +101,13 @@ void totemsrp_event_signal (void *srp_context, enum totem_event_type type, int v
 
 extern void totemsrp_net_mtu_adjust (struct totem_config *totem_config);
 
+extern int totemsrp_nodestatus_get (void *srp_context, unsigned int nodeid,
+				    struct totem_node_status *node_status);
+
 extern int totemsrp_ifaces_get (
 	void *srp_context,
 	unsigned int nodeid,
+	unsigned int *interface_id,
 	struct totem_ip_address *interfaces,
 	unsigned int interfaces_size,
 	char ***status,
@@ -120,27 +124,45 @@ extern int totemsrp_crypto_set (
 	const char *cipher_type,
 	const char *hash_type);
 
-extern int totemsrp_ring_reenable (
-	void *srp_context);
-
 void totemsrp_service_ready_register (
 	void *srp_context,
 	void (*totem_service_ready) (void));
+
+extern int totemsrp_iface_set (
+	void *srp_context,
+	const struct totem_ip_address *interface_addr,
+	unsigned short ip_port,
+	unsigned int iface_no);
 
 extern int totemsrp_member_add (
 	void *srp_context,
 	const struct totem_ip_address *member,
 	int ring_no);
-	
+
 extern int totemsrp_member_remove (
 	void *srp_context,
 	const struct totem_ip_address *member,
 	int ring_no);
-	
+
 void totemsrp_threaded_mode_enable (
 	void *srp_context);
 
 void totemsrp_trans_ack (
 	void *srp_context);
+
+int totemsrp_reconfigure (
+	void *context,
+	struct totem_config *totem_config);
+
+int totemsrp_crypto_reconfigure_phase (
+	void *context,
+	struct totem_config *totem_config,
+	cfg_message_crypto_reconfig_phase_t phase);
+
+void totemsrp_stats_clear (
+	void *srp_context, int flags);
+
+void totemsrp_force_gather (
+	void *context);
 
 #endif /* TOTEMSRP_H_DEFINED */

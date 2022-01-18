@@ -39,8 +39,6 @@ EXTRA_DIST		= autogen.sh $(SPEC).in \
 			  build-aux/release.mk \
 			  .version
 
-AUTOMAKE_OPTIONS	= foreign
-
 ACLOCAL_AMFLAGS		= -I m4
 
 MAINTAINERCLEANFILES	= Makefile.in aclocal.m4 configure depcomp \
@@ -48,10 +46,10 @@ MAINTAINERCLEANFILES	= Makefile.in aclocal.m4 configure depcomp \
 			  autoheader automake autoconf test_lense.sh \
 			  autoscan.log configure.scan ltmain.sh test-driver
 
-dist_doc_DATA		= LICENSE INSTALL README.recovery SECURITY AUTHORS
+dist_doc_DATA		= LICENSE INSTALL README.recovery AUTHORS
 
-SUBDIRS			= include common_lib lib exec tools test cts pkgconfig \
-			  man init conf qdevices
+SUBDIRS			= include common_lib lib exec tools test pkgconfig \
+			  man init conf vqsim
 
 coverity:
 	rm -rf cov
@@ -126,27 +124,29 @@ clean-generic:
 $(SPEC): $(SPEC).in
 	rm -f $@-t $@
 	date="$(shell LC_ALL=C date "+%a %b %d %Y")" && \
-	if [ -f .tarball-version ]; then \
-		gitver="$(shell cat .tarball-version)" && \
-		rpmver=$$gitver && \
+	gvgver="`cd $(abs_srcdir); build-aux/git-version-gen --fallback $(VERSION) .tarball-version .gitarchivever`" && \
+	if [ "$$gvgver" = "`echo $$gvgver | sed 's/-/./'`" ];then \
+		rpmver="$$gvgver" && \
 		alphatag="" && \
 		dirty="" && \
-		numcomm=""; \
+		numcomm="0"; \
 	else \
-		gitver="$(shell git describe --abbrev=4 --match='v*' HEAD 2>/dev/null)" && \
-		rpmver=`echo $$gitver | sed -e "s/^v//" -e "s/-.*//g"` && \
-		alphatag=`echo $$gitver | sed -e "s/.*-//" -e "s/^g//"` && \
-		vtag=`echo $$gitver | sed -e "s/-.*//g"` && \
-		numcomm=`git rev-list $$vtag..HEAD | wc -l` && \
-		git update-index --refresh > /dev/null 2>&1 || true && \
-		dirty=`git diff-index --name-only HEAD 2>/dev/null`; \
+		gitver="`echo $$gvgver | sed 's/\(.*\)\./\1-/'`" && \
+		rpmver=`echo $$gitver | sed 's/-.*//g'` && \
+		alphatag=`echo $$gvgver | sed 's/[^-]*-\([^-]*\).*/\1/'` && \
+		numcomm=`echo $$gitver | sed 's/[^-]*-\([^-]*\).*/\1/'` && \
+		dirty="" && \
+		if [ "`echo $$gitver | sed 's/^.*-dirty$$//g'`" = "" ];then \
+			dirty="dirty"; \
+		fi \
 	fi && \
+	if [ -n "$$dirty" ]; then dirty="dirty"; else dirty=""; fi && \
 	if [ "$$numcomm" = "0" ]; then numcomm=""; fi && \
 	if [ -n "$$numcomm" ]; then numcomm="%global numcomm $$numcomm"; fi && \
 	if [ "$$alphatag" = "$$gitver" ]; then alphatag=""; fi && \
 	if [ -n "$$alphatag" ]; then alphatag="%global alphatag $$alphatag"; fi && \
 	if [ -n "$$dirty" ]; then dirty="%global dirty dirty"; fi && \
-	sed \
+	$(SED) \
 		-e "s#@version@#$$rpmver#g" \
 		-e "s#@ALPHATAG@#$$alphatag#g" \
 		-e "s#@NUMCOMM@#$$numcomm#g" \

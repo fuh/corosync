@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2005-2010 Red Hat, Inc.
+ * Copyright (c) 2005-2019 Red Hat, Inc.
  *
  * All rights reserved.
  *
@@ -41,7 +41,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <stdint.h>
-#include <corosync/list.h>
+#include <qb/qblist.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -67,6 +67,13 @@ struct totem_ip_address
 	unsigned char  addr[TOTEMIP_ADDRLEN];
 } __attribute__((packed));
 
+enum totem_ip_version_enum {
+	TOTEM_IP_VERSION_4,		/* Use only AF_INET */
+	TOTEM_IP_VERSION_6,		/* Use only AF_INET6 */
+	TOTEM_IP_VERSION_4_6,		/* Use AF_UNSPEC and filter result preferring AF_INET */
+	TOTEM_IP_VERSION_6_4		/* Use AF_UNSPEC and filter result preferring AF_INET6 */
+};
+
 struct totem_ip_if_address
 {
 	struct totem_ip_address ip_addr;
@@ -74,35 +81,36 @@ struct totem_ip_if_address
 	int interface_up;
 	int interface_num;
 	char *name;
-	struct list_head list;
+	struct qb_list_head list;
 };
 
 extern int totemip_equal(const struct totem_ip_address *addr1,
 			 const struct totem_ip_address *addr2);
+extern int totemip_sa_equal(const struct totem_ip_address *totem_ip,
+			const struct sockaddr *sa);
 extern int totemip_compare(const void *a, const void *b);
 extern int totemip_is_mcast(struct totem_ip_address *addr);
 extern void totemip_copy(struct totem_ip_address *addr1,
 			 const struct totem_ip_address *addr2);
-extern void totemip_copy_endian_convert(struct totem_ip_address *addr1,
-					const struct totem_ip_address *addr2);
 int totemip_localhost(int family, struct totem_ip_address *localhost);
 extern int totemip_localhost_check(const struct totem_ip_address *addr);
 extern const char *totemip_print(const struct totem_ip_address *addr);
+extern const char *totemip_sa_print(const struct sockaddr *sa);
 extern int totemip_sockaddr_to_totemip_convert(const struct sockaddr_storage *saddr,
 					       struct totem_ip_address *ip_addr);
 extern int totemip_totemip_to_sockaddr_convert(struct totem_ip_address *ip_addr,
 					       uint16_t port, struct sockaddr_storage *saddr, int *addrlen);
 extern int totemip_parse(struct totem_ip_address *totemip, const char *addr,
-			 int family);
+			 enum totem_ip_version_enum ip_version);
 extern int totemip_iface_check(struct totem_ip_address *bindnet,
 			       struct totem_ip_address *boundto,
 			       int *interface_up,
 			       int *interface_num,
 			       int mask_high_bit);
 
-extern int totemip_getifaddrs(struct list_head *addrs);
+extern int totemip_getifaddrs(struct qb_list_head *addrs);
 
-extern void totemip_freeifaddrs(struct list_head *addrs);
+extern void totemip_freeifaddrs(struct qb_list_head *addrs);
 
 /* These two simulate a zero in_addr by clearing the family field */
 static inline void totemip_zero_set(struct totem_ip_address *addr)

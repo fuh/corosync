@@ -40,6 +40,9 @@
 extern "C" {
 #endif
 
+/**
+ * @brief sam_recovery_policy_t enum
+ */
 typedef enum {
 	SAM_RECOVERY_POLICY_QUIT = 1,
 	SAM_RECOVERY_POLICY_RESTART = 2,
@@ -51,17 +54,17 @@ typedef enum {
 } sam_recovery_policy_t;
 
 /**
- * Callback definition for event driven checking
+ * @brief Callback definition for event driven checking
  */
 typedef int (*sam_hc_callback_t)(void);
 
 /**
- * Create a new SAM connection.
+ * @brief Create a new SAM connection.
  *
  * This function must be called before any other.
  * It is recommended to call it as one of first in application.
  *
- * @param time_interval Time interval in miliseconds of healthcheck. After this time, application
+ * @param time_interval Time interval in milliseconds of healthcheck. After this time, application
  *        will be killed and recovery policy will be taken. This can be zero, which means,
  *        that there is no time limit (only fall of application is checked and only then
  *        recovery action is taken)
@@ -78,7 +81,7 @@ cs_error_t sam_initialize (
         sam_recovery_policy_t recovery_policy);
 
 /**
- * Close the SAM handle.
+ * @brief Close the SAM handle.
  *
  * This function should be called as late as possible.
  * (in reality, if you plan just quit, and checking is stopped, there is no need
@@ -91,7 +94,7 @@ cs_error_t sam_initialize (
 cs_error_t sam_finalize (void);
 
 /**
- * Start healthchecking.
+ * @brief Start healthchecking.
  *
  * From this time, you should call every time_interval
  * sam_hc_send, otherwise, recovery action will be taken.
@@ -102,7 +105,7 @@ cs_error_t sam_finalize (void);
 cs_error_t sam_start (void);
 
 /**
- * Stop healthchecking.
+ * @brief Stop healthchecking.
  *
  * Oposite of #sam_start. You can call sam_start and sam_stop how many
  * times you want.
@@ -114,7 +117,7 @@ cs_error_t sam_start (void);
 cs_error_t sam_stop (void);
 
 /**
- * Set warning signal to be send.
+ * @brief Set warning signal to be sent.
  *
  * Default signal is SIGTERM. You can use SIGKILL to emulate NOT sending
  * warning signal and just send SIGKILL.
@@ -126,7 +129,7 @@ cs_error_t sam_stop (void);
 cs_error_t sam_warn_signal_set (int warn_signal);
 
 /**
- * Register application.
+ * @brief Register application.
  *
  * This is one of most crucial function. In case, your
  * application will be restarted, you will always return to point after calling
@@ -148,7 +151,7 @@ cs_error_t sam_register (
 	unsigned int *instance_id);
 
 /**
- * Send healthcheck confirmation.
+ * @brief Send healthcheck confirmation.
  *
  * This should be called after #sam_start
  *
@@ -159,7 +162,7 @@ cs_error_t sam_register (
 cs_error_t sam_hc_send (void);
 
 /**
- * Register healtcheck callback.
+ * @brief Register healtcheck callback.
  *
  * After you will call this function, and set
  * cb to something else then NULL, SAM is automatically switched from
@@ -179,7 +182,7 @@ cs_error_t sam_hc_send (void);
 cs_error_t sam_hc_callback_register (sam_hc_callback_t cb);
 
 /**
- * Return size of stored data.
+ * @brief Return size of stored data.
  *
  * @param size Pointer to variable, where stored data size is returned. If
  *        nothing or NULL is stored, then 0 is returned.
@@ -192,7 +195,7 @@ cs_error_t sam_hc_callback_register (sam_hc_callback_t cb);
 cs_error_t sam_data_getsize (size_t *size);
 
 /**
- * Return stored data.
+ * @brief Return stored data.
  *
  * @param data Pointer to place, where to store data
  * @param size Allocated size of data
@@ -206,7 +209,7 @@ cs_error_t sam_data_restore (
 	size_t size);
 
 /**
- * Store user data.
+ * @brief Store user data.
  *
  * Such stored data survives restart of child.
  *
@@ -217,7 +220,7 @@ cs_error_t sam_data_restore (
  * @retval CS_ERR_BAD_HANDLE if you call this function before sam_init or
  *         after sam_finalize
  * @retval CS_ERR_NO_MEMORY if data is too large and malloc/realloc was not
- *         sucesfull
+ *         succesfull
  * @retval CS_ERR_LIBRARY if some internal error appeared (communication with parent
  *         process)
  */
@@ -226,15 +229,15 @@ cs_error_t sam_data_store (
 	size_t size);
 
 /**
- * Marks child as failed.
+ * @brief Marks child as failed.
  *
  * This can be called only with SAM_RECOVERY_POLICY_CMAP flag set and
- * makes sense only for SAM_RECOVERY_POLICY_RESTART. This will kill child without sending warn
+ * makes sense only for SAM_RECOVERY_POLICY_RESTART. This will kill child without sending warning
  * signal. Cmap state key will be set to failed.
  *
  * @retval CS_OK in case no problem appeared
  * @retval CS_ERR_BAD_HANDLE library was not initialized or was already finalized
- * @retval CS_ERR_INVALID_PARAM recovery policy doesn't has SAM_RECOVERY_POLICY_CMAP flag set
+ * @retval CS_ERR_INVALID_PARAM recovery policy doesn't have SAM_RECOVERY_POLICY_CMAP flag set
  * @retval CS_ERR_LIBRARY if some internal error appeared (communication with parent
  *         process)
  */

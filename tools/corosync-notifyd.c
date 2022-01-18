@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011-2012 Red Hat, Inc.
+ * Copyright (c) 2011-2017 Red Hat, Inc.
  *
  * All rights reserved.
  *
@@ -52,15 +52,17 @@
 
 #include <qb/qbdefs.h>
 #include <qb/qbloop.h>
+#include <qb/qbmap.h>
 #include <qb/qblog.h>
-
-#include <qb/qbdefs.h>
-#include <qb/qbloop.h>
 
 #include <corosync/corotypes.h>
 #include <corosync/cfg.h>
 #include <corosync/quorum.h>
 #include <corosync/cmap.h>
+
+#ifdef HAVE_LIBSYSTEMD
+#include <systemd/sd-daemon.h>
+#endif
 
 /*
  * generic declarations
@@ -71,36 +73,48 @@ enum {
 	CS_NTF_SNMP,
 	CS_NTF_DBUS,
 	CS_NTF_FG,
+	CS_NTF_NODNS,
 	CS_NTF_MAX,
 };
 static int conf[CS_NTF_MAX];
+
+static int exit_code = 0;
 
 static int32_t _cs_is_quorate = 0;
 
 typedef void (*node_membership_fn_t)(char *nodename, uint32_t nodeid, char *state, char* ip);
 typedef void (*node_quorum_fn_t)(char *nodename, uint32_t nodeid, const char *state);
 typedef void (*application_connection_fn_t)(char *nodename, uint32_t nodeid, char *app_name, const char *state);
-typedef void (*rrp_faulty_fn_t)(char *nodename, uint32_t nodeid, uint32_t iface_no, const char *state);
+typedef void (*link_faulty_fn_t)(char *nodename, uint32_t local_nodeid, uint32_t nodeid, uint32_t iface_no, const char *state);
 
 struct notify_callbacks {
 	node_membership_fn_t node_membership_fn;
 	node_quorum_fn_t node_quorum_fn;
 	application_connection_fn_t application_connection_fn;
-	rrp_faulty_fn_t rrp_faulty_fn;
+	link_faulty_fn_t link_faulty_fn;
+};
+
+struct track_item {
+	char key_name[CMAP_KEYNAME_MAXLEN + 1];
+	cmap_track_handle_t track_handle;
 };
 
 #define MAX_NOTIFIERS 5
 static int num_notifiers = 0;
 static struct notify_callbacks notifiers[MAX_NOTIFIERS];
-static uint32_t local_nodeid = 0;
+/*
+ * Global variable with local nodeid
+ */
+static uint32_t g_local_nodeid = 0;
 static char local_nodename[CS_MAX_NAME_LENGTH];
 static qb_loop_t *main_loop;
 static quorum_handle_t quorum_handle;
+static qb_map_t *tracker_map;
 
 static void _cs_node_membership_event(char *nodename, uint32_t nodeid, char *state, char* ip);
 static void _cs_node_quorum_event(const char *state);
 static void _cs_application_connection_event(char *app_name, const char *state);
-static void _cs_rrp_faulty_event(uint32_t iface_no, const char *state);
+static void _cs_link_faulty_event(uint32_t nodeid, uint32_t iface_no, const char *state);
 
 #ifdef HAVE_DBUS
 #include <dbus/dbus.h>
@@ -138,6 +152,7 @@ enum snmp_node_status {
 #define SNMP_OID_OBJECT_NODE_ID		SNMP_OID_OBJECT_ROOT ".2"
 #define SNMP_OID_OBJECT_NODE_STATUS	SNMP_OID_OBJECT_ROOT ".3"
 #define SNMP_OID_OBJECT_NODE_ADDR	SNMP_OID_OBJECT_ROOT ".4"
+#define SNMP_OID_OBJECT_LOCAL_NODE_ID		SNMP_OID_OBJECT_ROOT ".5"
 
 #define SNMP_OID_OBJECT_RINGSEQ		SNMP_OID_OBJECT_ROOT ".20"
 #define SNMP_OID_OBJECT_QUORUM		SNMP_OID_OBJECT_ROOT ".21"
@@ -145,20 +160,22 @@ enum snmp_node_status {
 #define SNMP_OID_OBJECT_APP_NAME	SNMP_OID_OBJECT_ROOT ".40"
 #define SNMP_OID_OBJECT_APP_STATUS	SNMP_OID_OBJECT_ROOT ".41"
 
-#define SNMP_OID_OBJECT_RRP_IFACE_NO	SNMP_OID_OBJECT_ROOT ".60"
-#define SNMP_OID_OBJECT_RRP_STATUS	SNMP_OID_OBJECT_ROOT ".61"
+#define SNMP_OID_OBJECT_LINK_IFACE_NO	SNMP_OID_OBJECT_ROOT ".60"
+#define SNMP_OID_OBJECT_LINK_STATUS	SNMP_OID_OBJECT_ROOT ".61"
 
 #define SNMP_OID_TRAPS_ROOT		SNMP_OID_COROSYNC ".0"
 #define SNMP_OID_TRAPS_NODE		SNMP_OID_TRAPS_ROOT ".1"
 #define SNMP_OID_TRAPS_QUORUM		SNMP_OID_TRAPS_ROOT ".2"
 #define SNMP_OID_TRAPS_APP		SNMP_OID_TRAPS_ROOT ".3"
-#define SNMP_OID_TRAPS_RRP		SNMP_OID_TRAPS_ROOT ".4"
+#define SNMP_OID_TRAPS_LINK		SNMP_OID_TRAPS_ROOT ".4"
 
 #define CS_TIMESTAMP_STR_LEN 20
 static const char *local_host = "localhost";
 #endif /* ENABLE_SNMP */
 static char snmp_manager_buf[CS_MAX_NAME_LENGTH];
 static char *snmp_manager = NULL;
+static char snmp_community_buf[CS_MAX_NAME_LENGTH];
+static char *snmp_community = NULL;
 
 #define CMAP_MAX_RETRIES 10
 
@@ -166,6 +183,10 @@ static char *snmp_manager = NULL;
  * cmap
  */
 static cmap_handle_t cmap_handle;
+static cmap_handle_t stats_handle;
+static cmap_track_handle_t cmap_track_handle_runtime_members_key_changed;
+static cmap_track_handle_t cmap_track_handle_stats_ipcs_key_changed;
+static cmap_track_handle_t cmap_track_handle_stats_knet_key_changed;
 
 static int32_t _cs_ip_to_hostname(char* ip, char* name_out)
 {
@@ -186,7 +207,7 @@ static int32_t _cs_ip_to_hostname(char* ip, char* name_out)
 	rc = getnameinfo((struct sockaddr*)&sa, sizeof(sa),
 			name_out, CS_MAX_NAME_LENGTH, NULL, 0, 0);
 	if (rc != 0) {
-		qb_log(LOG_ERR, 0, "error looking up %s : %s", ip, gai_strerror(rc));
+		qb_log(LOG_ERR, "error looking up %s : %s", ip, gai_strerror(rc));
 		return -EINVAL;
 	}
 	return 0;
@@ -215,7 +236,12 @@ static void _cs_cmap_members_key_changed (
 		return ;
 	}
 
-	res = sscanf(key_name, "runtime.totem.pg.mrp.srp.members.%u.%s", &nodeid, tmp_key);
+	if (NULL == key_name) {
+		qb_log(LOG_ERR, "key_name: nil");
+		return ;
+	}
+
+	res = sscanf(key_name, "runtime.members.%u.%s", &nodeid, tmp_key);
 	if (res != 2)
 		return ;
 
@@ -223,7 +249,11 @@ static void _cs_cmap_members_key_changed (
 		return ;
 	}
 
-	snprintf(tmp_key, CMAP_KEYNAME_MAXLEN, "runtime.totem.pg.mrp.srp.members.%u.ip", nodeid);
+	res = snprintf(tmp_key, CMAP_KEYNAME_MAXLEN, "runtime.members.%u.ip", nodeid);
+	if (res <= 0 || res >= CMAP_KEYNAME_MAXLEN) {
+		qb_log(LOG_ERR, "temp_key: failed, res: %d, nodeid: " CS_PRI_NODE_ID, res, nodeid);
+		return ;
+	}
 	no_retries = 0;
 	while ((err = cmap_get_string(cmap_handle, tmp_key, &ip_str)) == CS_ERR_TRY_AGAIN &&
 			no_retries++ < CMAP_MAX_RETRIES) {
@@ -237,11 +267,27 @@ static void _cs_cmap_members_key_changed (
 	 * We want the ip out of: "r(0) ip(192.168.100.92)"
 	 */
 	open_bracket = strrchr(ip_str, '(');
+	if (NULL == open_bracket) {
+		qb_log(LOG_ERR, "ip_str: %s", ip_str);
+		free(ip_str);
+		return ;
+	}
 	open_bracket++;
-	close_bracket = strrchr(open_bracket, ')');
+	close_bracket = strchr(open_bracket, ')');
+	if (NULL == close_bracket) {
+		qb_log(LOG_ERR, "open_bracket: %s", open_bracket);
+		free(ip_str);
+		return ;
+	}
 	*close_bracket = '\0';
-	_cs_ip_to_hostname(open_bracket, nodename);
-
+	if(conf[CS_NTF_NODNS]) {
+		strncpy(nodename, open_bracket, CS_MAX_NAME_LENGTH-1);
+	} else {
+		res = _cs_ip_to_hostname(open_bracket, nodename);
+		if (res) {
+			strncpy(nodename, open_bracket, CS_MAX_NAME_LENGTH-1);
+		}
+	}
 	_cs_node_membership_event(nodename, nodeid, (char *)new_value.data, open_bracket);
 	free(ip_str);
 }
@@ -258,18 +304,26 @@ static void _cs_cmap_connections_key_changed (
 	char obj_name[CS_MAX_NAME_LENGTH];
 	char conn_str[CMAP_KEYNAME_MAXLEN];
 	char tmp_key[CMAP_KEYNAME_MAXLEN];
+	int service, pid;
 	int res;
 
-	res = sscanf(key_name, "runtime.connections.%[^.].%s", conn_str, tmp_key);
-	if (res != 2) {
+	res = sscanf(key_name, "stats.ipcs.service%d.%d.%[^.].%s", &service,&pid, conn_str, tmp_key);
+	if (res != 4) {
 		return ;
 	}
 
-	if (strcmp(tmp_key, "service_id") != 0) {
+	if (strcmp(tmp_key, "procname") != 0) {
 		return ;
 	}
 
-	snprintf(obj_name, CS_MAX_NAME_LENGTH, "%s", conn_str);
+	if (snprintf(obj_name, CS_MAX_NAME_LENGTH, "%s.%d.%s", conn_str, pid,
+	    (char*)new_value.data) >= CS_MAX_NAME_LENGTH) {
+		/*
+		 * This should never happen
+		 */
+		qb_log(LOG_ERR, "Can't snprintf obj_name");
+		return ;
+	}
 
 	if (event == CMAP_TRACK_ADD) {
 		_cs_application_connection_event(obj_name, "connected");
@@ -280,7 +334,7 @@ static void _cs_cmap_connections_key_changed (
 	}
 }
 
-static void _cs_cmap_rrp_faulty_key_changed (
+static void _cs_cmap_link_faulty_key_changed (
 	cmap_handle_t cmap_handle_c,
 	cmap_track_handle_t cmap_track_handle,
 	int32_t event,
@@ -290,23 +344,19 @@ static void _cs_cmap_rrp_faulty_key_changed (
 	void *user_data)
 {
 	uint32_t iface_no;
-	char tmp_key[CMAP_KEYNAME_MAXLEN];
+	uint32_t nodeid;
 	int res;
 	int no_retries;
-	uint8_t faulty;
+	uint8_t connected;
 	cs_error_t err;
 
-	res = sscanf(key_name, "runtime.totem.pg.mrp.rrp.%u.%s", &iface_no, tmp_key);
+	res = sscanf(key_name, "stats.knet.node%u.link%u.connected", &nodeid, &iface_no);
 	if (res != 2) {
 		return ;
 	}
 
-	if (strcmp(tmp_key, "faulty") != 0) {
-		return ;
-	}
-
 	no_retries = 0;
-	while ((err = cmap_get_uint8(cmap_handle, key_name, &faulty)) == CS_ERR_TRY_AGAIN &&
+	while ((err = cmap_get_uint8(stats_handle, key_name, &connected)) == CS_ERR_TRY_AGAIN &&
 			no_retries++ < CMAP_MAX_RETRIES) {
 		sleep(1);
 	}
@@ -315,24 +365,73 @@ static void _cs_cmap_rrp_faulty_key_changed (
 		return ;
 	}
 
-	if (faulty) {
-		_cs_rrp_faulty_event(iface_no, "faulty");
+	if (connected) {
+		_cs_link_faulty_event(nodeid, iface_no, "operational");
 	} else {
-		_cs_rrp_faulty_event(iface_no, "operational");
+		_cs_link_faulty_event(nodeid, iface_no, "disconnected");
 	}
 }
+
+static void _cs_cmap_link_added_removed (
+	cmap_handle_t cmap_handle_c,
+	cmap_track_handle_t track_handle,
+	int32_t event,
+	const char *key_name,
+	struct cmap_notify_value new_value,
+	struct cmap_notify_value old_value,
+	void *user_data)
+{
+	struct track_item *track_item;
+	cs_error_t err;
+
+	/* Add/remove a tracker for a new/removed knet link */
+	if (strstr(key_name, ".connected")) {
+		if (event == CMAP_TRACK_ADD) {
+			assert(strlen(key_name) < sizeof(track_item->key_name));
+
+			track_item = malloc(sizeof(struct track_item));
+			if (!track_item) {
+				qb_log(LOG_WARNING, "Can't alloc track_item for new/removed knet link");
+				return;
+			}
+			err = cmap_track_add(stats_handle, key_name, CMAP_TRACK_MODIFY,
+			    _cs_cmap_link_faulty_key_changed, NULL, &track_handle);
+			if (err != CS_OK) {
+				qb_log(LOG_WARNING, "Can't add tracker for new/removed knet link");
+
+				free(track_item);
+				return ;
+			}
+
+			strcpy(track_item->key_name, key_name);
+
+			track_item->track_handle = track_handle;
+			qb_map_put(tracker_map, track_item->key_name, track_item);
+		} else {
+			track_item = qb_map_get(tracker_map, key_name);
+			if (track_item) {
+				cmap_track_delete(stats_handle, track_item->track_handle);
+				qb_map_rm(tracker_map, track_item->key_name);
+				free(track_item);
+			}
+		}
+	}
+}
+
 
 static int
 _cs_cmap_dispatch(int fd, int revents, void *data)
 {
 	cs_error_t err;
 
-	err = cmap_dispatch(cmap_handle, CS_DISPATCH_ONE);
+	err = cmap_dispatch(*(cmap_handle_t *)data, CS_DISPATCH_ONE);
 
 	if (err != CS_OK && err != CS_ERR_TRY_AGAIN && err != CS_ERR_TIMEOUT &&
 		err != CS_ERR_QUEUE_FULL) {
 		qb_log(LOG_ERR, "Could not dispatch cmap events. Error %u", err);
 		qb_loop_stop(main_loop);
+
+		exit_code = 1;
 
 		return -1;
 	}
@@ -366,6 +465,8 @@ _cs_quorum_dispatch(int fd, int revents, void *data)
 		err != CS_ERR_QUEUE_FULL) {
 		qb_log(LOG_ERR, "Could not dispatch quorum events. Error %u", err);
 		qb_loop_stop(main_loop);
+
+		exit_code = 1;
 
 		return -1;
 	}
@@ -590,7 +691,7 @@ out_free:
 }
 
 static void
-_cs_dbus_rrp_faulty_event(char *nodename, uint32_t nodeid, uint32_t iface_no, const char *state)
+_cs_dbus_link_faulty_event(char *nodename, uint32_t local_nodeid, uint32_t nodeid, uint32_t iface_no, const char *state)
 {
 	DBusMessage *msg = NULL;
 
@@ -621,11 +722,12 @@ _cs_dbus_rrp_faulty_event(char *nodename, uint32_t nodeid, uint32_t iface_no, co
 
 	if (!dbus_message_append_args(msg,
 			DBUS_TYPE_STRING, &nodename,
+			DBUS_TYPE_UINT32, &local_nodeid,
 			DBUS_TYPE_UINT32, &nodeid,
 			DBUS_TYPE_UINT32, &iface_no,
 			DBUS_TYPE_STRING, &state,
 			DBUS_TYPE_INVALID)) {
-		qb_log(LOG_ERR, "error adding args to rrp signal");
+		qb_log(LOG_ERR, "error adding args to link signal");
 		goto out_unlock;
 	}
 
@@ -666,8 +768,8 @@ _cs_dbus_init(void)
 		_cs_dbus_node_quorum_event;
 	notifiers[num_notifiers].application_connection_fn =
 		_cs_dbus_application_connection_event;
-	notifiers[num_notifiers].rrp_faulty_fn =
-		_cs_dbus_rrp_faulty_event;
+	notifiers[num_notifiers].link_faulty_fn =
+		_cs_dbus_link_faulty_event;
 
 	num_notifiers++;
 }
@@ -675,7 +777,7 @@ _cs_dbus_init(void)
 #endif /* HAVE_DBUS */
 
 #ifdef ENABLE_SNMP
-static netsnmp_session *snmp_init (const char *target)
+static netsnmp_session *_cs_snmp_session_init (const char *target)
 {
 	static netsnmp_session *session = NULL;
 #ifndef NETSNMPV54
@@ -696,6 +798,11 @@ static netsnmp_session *snmp_init (const char *target)
 	session->callback = NULL;
 	session->callback_magic = NULL;
 
+	if (snmp_community) {
+		session->community = (u_char *)snmp_community;
+		session->community_len = strlen(snmp_community_buf);
+	}
+
 	session = snmp_add(session,
 #ifdef NETSNMPV54
 		netsnmp_transport_open_client ("snmptrap", target),
@@ -710,7 +817,7 @@ static netsnmp_session *snmp_init (const char *target)
 	return (session);
 }
 
-static inline void add_field (
+static void _cs_snmp_add_field (
 	netsnmp_pdu *trap_pdu,
 	u_char asn_type,
 	const char *prefix,
@@ -724,38 +831,63 @@ static inline void add_field (
 	}
 }
 
-static void
-_cs_snmp_node_membership_event(char *nodename, uint32_t nodeid, char *state, char* ip)
+static netsnmp_pdu *_cs_snmp_trap_pdu_init (const char *trap_oid)
 {
-	int ret;
-	char csysuptime[CS_TIMESTAMP_STR_LEN];
 	static oid snmptrap_oid[]  = { 1,3,6,1,6,3,1,1,4,1,0 };
 	static oid sysuptime_oid[] = { 1,3,6,1,2,1,1,3,0 };
-	time_t now = time (NULL);
-
+	char csysuptime[CS_TIMESTAMP_STR_LEN];
+	time_t now;
+	struct tm *now_tm;
 	netsnmp_pdu *trap_pdu;
-	netsnmp_session *session = snmp_init (snmp_manager);
-	if (session == NULL) {
-		qb_log(LOG_NOTICE, "Failed to init SNMP session.");
-		return ;
+
+	now = time (NULL);
+	if (now == ((time_t)-1)) {
+		qb_log(LOG_NOTICE, "Failed to get timestamp.");
+		return (NULL);
+	}
+
+	/* format uptime */
+	now_tm = localtime(&now);
+	if (now_tm == NULL || strftime (csysuptime, sizeof(csysuptime), "%s", now_tm) == 0) {
+		qb_log(LOG_NOTICE, "Failed to format timestamp.");
+		return (NULL);
 	}
 
 	trap_pdu = snmp_pdu_create (SNMP_MSG_TRAP2);
 	if (!trap_pdu) {
 		qb_log(LOG_NOTICE, "Failed to create SNMP notification.");
-		return ;
+		return (NULL);
 	}
 
 	/* send uptime */
-	snprintf (csysuptime, CS_TIMESTAMP_STR_LEN, "%ld", now);
 	snmp_add_var (trap_pdu, sysuptime_oid, sizeof (sysuptime_oid) / sizeof (oid), 't', csysuptime);
-	snmp_add_var (trap_pdu, snmptrap_oid, sizeof (snmptrap_oid) / sizeof (oid), 'o', SNMP_OID_TRAPS_NODE);
+	snmp_add_var (trap_pdu, snmptrap_oid, sizeof (snmptrap_oid) / sizeof (oid), 'o', trap_oid);
+
+	return (trap_pdu);
+}
+
+static void
+_cs_snmp_node_membership_event(char *nodename, uint32_t nodeid, char *state, char* ip)
+{
+	int ret;
+	netsnmp_pdu *trap_pdu;
+	netsnmp_session *session = _cs_snmp_session_init (snmp_manager);
+
+	if (session == NULL) {
+		qb_log(LOG_NOTICE, "Failed to init SNMP session.");
+		return ;
+	}
+
+	trap_pdu = _cs_snmp_trap_pdu_init(SNMP_OID_TRAPS_NODE);
+	if (trap_pdu == NULL) {
+		return ;
+	}
 
 	/* Add extries to the trap */
-	add_field (trap_pdu, ASN_OCTET_STR, SNMP_OID_OBJECT_NODE_NAME, (void*)nodename, strlen (nodename));
-	add_field (trap_pdu, ASN_INTEGER, SNMP_OID_OBJECT_NODE_ID, (void*)&nodeid, sizeof (nodeid));
-	add_field (trap_pdu, ASN_OCTET_STR, SNMP_OID_OBJECT_NODE_ADDR, (void*)ip, strlen (ip));
-	add_field (trap_pdu, ASN_OCTET_STR, SNMP_OID_OBJECT_NODE_STATUS, (void*)state, strlen (state));
+	_cs_snmp_add_field (trap_pdu, ASN_OCTET_STR, SNMP_OID_OBJECT_NODE_NAME, (void*)nodename, strlen (nodename));
+	_cs_snmp_add_field (trap_pdu, ASN_UNSIGNED, SNMP_OID_OBJECT_NODE_ID, (void*)&nodeid, sizeof (nodeid));
+	_cs_snmp_add_field (trap_pdu, ASN_OCTET_STR, SNMP_OID_OBJECT_NODE_ADDR, (void*)ip, strlen (ip));
+	_cs_snmp_add_field (trap_pdu, ASN_OCTET_STR, SNMP_OID_OBJECT_NODE_STATUS, (void*)state, strlen (state));
 
 	/* Send and cleanup */
 	ret = snmp_send (session, trap_pdu);
@@ -771,33 +903,23 @@ _cs_snmp_node_quorum_event(char *nodename, uint32_t nodeid,
 			   const char *state)
 {
 	int ret;
-	char csysuptime[20];
-	static oid snmptrap_oid[]  = { 1,3,6,1,6,3,1,1,4,1,0 };
-	static oid sysuptime_oid[] = { 1,3,6,1,2,1,1,3,0 };
-	time_t now = time (NULL);
-
 	netsnmp_pdu *trap_pdu;
-	netsnmp_session *session = snmp_init (snmp_manager);
+	netsnmp_session *session = _cs_snmp_session_init (snmp_manager);
+
 	if (session == NULL) {
 		qb_log(LOG_NOTICE, "Failed to init SNMP session.");
 		return ;
 	}
 
-	trap_pdu = snmp_pdu_create (SNMP_MSG_TRAP2);
-	if (!trap_pdu) {
-		qb_log(LOG_NOTICE, "Failed to create SNMP notification.");
+	trap_pdu = _cs_snmp_trap_pdu_init(SNMP_OID_TRAPS_QUORUM);
+	if (trap_pdu == NULL) {
 		return ;
 	}
 
-	/* send uptime */
-	sprintf (csysuptime, "%ld", now);
-	snmp_add_var (trap_pdu, sysuptime_oid, sizeof (sysuptime_oid) / sizeof (oid), 't', csysuptime);
-	snmp_add_var (trap_pdu, snmptrap_oid, sizeof (snmptrap_oid) / sizeof (oid), 'o', SNMP_OID_TRAPS_QUORUM);
-
 	/* Add extries to the trap */
-	add_field (trap_pdu, ASN_OCTET_STR, SNMP_OID_OBJECT_NODE_NAME, (void*)nodename, strlen (nodename));
-	add_field (trap_pdu, ASN_INTEGER, SNMP_OID_OBJECT_NODE_ID, (void*)&nodeid, sizeof (nodeid));
-	add_field (trap_pdu, ASN_OCTET_STR, SNMP_OID_OBJECT_QUORUM, (void*)state, strlen (state));
+	_cs_snmp_add_field (trap_pdu, ASN_OCTET_STR, SNMP_OID_OBJECT_NODE_NAME, (void*)nodename, strlen (nodename));
+	_cs_snmp_add_field (trap_pdu, ASN_UNSIGNED, SNMP_OID_OBJECT_NODE_ID, (void*)&nodeid, sizeof (nodeid));
+	_cs_snmp_add_field (trap_pdu, ASN_OCTET_STR, SNMP_OID_OBJECT_QUORUM, (void*)state, strlen (state));
 
 	/* Send and cleanup */
 	ret = snmp_send (session, trap_pdu);
@@ -809,38 +931,29 @@ _cs_snmp_node_quorum_event(char *nodename, uint32_t nodeid,
 }
 
 static void
-_cs_snmp_rrp_faulty_event(char *nodename, uint32_t nodeid,
+_cs_snmp_link_faulty_event(char *nodename, uint32_t local_nodeid, uint32_t nodeid,
 		uint32_t iface_no, const char *state)
 {
 	int ret;
-	char csysuptime[20];
-	static oid snmptrap_oid[]  = { 1,3,6,1,6,3,1,1,4,1,0 };
-	static oid sysuptime_oid[] = { 1,3,6,1,2,1,1,3,0 };
-	time_t now = time (NULL);
-
 	netsnmp_pdu *trap_pdu;
-	netsnmp_session *session = snmp_init (snmp_manager);
+	netsnmp_session *session = _cs_snmp_session_init (snmp_manager);
+
 	if (session == NULL) {
 		qb_log(LOG_NOTICE, "Failed to init SNMP session.");
 		return ;
 	}
 
-	trap_pdu = snmp_pdu_create (SNMP_MSG_TRAP2);
-	if (!trap_pdu) {
-		qb_log(LOG_NOTICE, "Failed to create SNMP notification.");
+	trap_pdu = _cs_snmp_trap_pdu_init(SNMP_OID_TRAPS_LINK);
+	if (trap_pdu == NULL) {
 		return ;
 	}
 
-	/* send uptime */
-	sprintf (csysuptime, "%ld", now);
-	snmp_add_var (trap_pdu, sysuptime_oid, sizeof (sysuptime_oid) / sizeof (oid), 't', csysuptime);
-	snmp_add_var (trap_pdu, snmptrap_oid, sizeof (snmptrap_oid) / sizeof (oid), 'o', SNMP_OID_TRAPS_RRP);
-
 	/* Add extries to the trap */
-	add_field (trap_pdu, ASN_OCTET_STR, SNMP_OID_OBJECT_NODE_NAME, (void*)nodename, strlen (nodename));
-	add_field (trap_pdu, ASN_INTEGER, SNMP_OID_OBJECT_NODE_ID, (void*)&nodeid, sizeof (nodeid));
-	add_field (trap_pdu, ASN_INTEGER, SNMP_OID_OBJECT_RRP_IFACE_NO, (void*)&iface_no, sizeof (iface_no));
-	add_field (trap_pdu, ASN_OCTET_STR, SNMP_OID_OBJECT_RRP_STATUS, (void*)state, strlen (state));
+	_cs_snmp_add_field (trap_pdu, ASN_OCTET_STR, SNMP_OID_OBJECT_NODE_NAME, (void*)nodename, strlen (nodename));
+	_cs_snmp_add_field (trap_pdu, ASN_UNSIGNED, SNMP_OID_OBJECT_LOCAL_NODE_ID, (void*)&local_nodeid, sizeof (local_nodeid));
+	_cs_snmp_add_field (trap_pdu, ASN_UNSIGNED, SNMP_OID_OBJECT_NODE_ID, (void*)&nodeid, sizeof (nodeid));
+	_cs_snmp_add_field (trap_pdu, ASN_INTEGER, SNMP_OID_OBJECT_LINK_IFACE_NO, (void*)&iface_no, sizeof (iface_no));
+	_cs_snmp_add_field (trap_pdu, ASN_OCTET_STR, SNMP_OID_OBJECT_LINK_STATUS, (void*)state, strlen (state));
 
 	/* Send and cleanup */
 	ret = snmp_send (session, trap_pdu);
@@ -863,8 +976,8 @@ _cs_snmp_init(void)
 	notifiers[num_notifiers].node_quorum_fn =
 		_cs_snmp_node_quorum_event;
 	notifiers[num_notifiers].application_connection_fn = NULL;
-	notifiers[num_notifiers].rrp_faulty_fn =
-		_cs_snmp_rrp_faulty_event;
+	notifiers[num_notifiers].link_faulty_fn =
+		_cs_snmp_link_faulty_event;
 	num_notifiers++;
 }
 
@@ -873,16 +986,16 @@ _cs_snmp_init(void)
 static void
 _cs_syslog_node_membership_event(char *nodename, uint32_t nodeid, char *state, char* ip)
 {
-	qb_log(LOG_NOTICE, "%s[%d] ip:%s %s", nodename, nodeid, ip, state);
+	qb_log(LOG_NOTICE, "%s[" CS_PRI_NODE_ID "] ip:%s %s", nodename, nodeid, ip, state);
 }
 
 static void
 _cs_syslog_node_quorum_event(char *nodename, uint32_t nodeid, const char *state)
 {
 	if (strcmp(state, "quorate") == 0) {
-		qb_log(LOG_NOTICE, "%s[%d] is now %s", nodename, nodeid, state);
+		qb_log(LOG_NOTICE, "%s[" CS_PRI_NODE_ID "] is now %s", nodename, nodeid, state);
 	} else {
-		qb_log(LOG_NOTICE, "%s[%d] has lost quorum", nodename, nodeid);
+		qb_log(LOG_NOTICE, "%s[" CS_PRI_NODE_ID "] has lost quorum", nodename, nodeid);
 	}
 }
 
@@ -890,16 +1003,16 @@ static void
 _cs_syslog_application_connection_event(char *nodename, uint32_t nodeid, char* app_name, const char *state)
 {
 	if (strcmp(state, "connected") == 0) {
-		qb_log(LOG_NOTICE, "%s[%d] %s is now %s to corosync", nodename, nodeid, app_name, state);
+		qb_log(LOG_NOTICE, "%s[" CS_PRI_NODE_ID "] %s is now %s to corosync", nodename, nodeid, app_name, state);
 	} else {
-		qb_log(LOG_NOTICE, "%s[%d] %s is now %s from corosync", nodename, nodeid, app_name, state);
+		qb_log(LOG_NOTICE, "%s[" CS_PRI_NODE_ID "] %s is now %s from corosync", nodename, nodeid, app_name, state);
 	}
 }
 
 static void
-_cs_syslog_rrp_faulty_event(char *nodename, uint32_t nodeid, uint32_t iface_no, const char *state)
+_cs_syslog_link_faulty_event(char *nodename, uint32_t our_nodeid, uint32_t nodeid, uint32_t iface_no, const char *state)
 {
-	qb_log(LOG_NOTICE, "%s[%d] interface %u is now %s", nodename, nodeid, iface_no, state);
+	qb_log(LOG_NOTICE, "%s[" CS_PRI_NODE_ID "] link %u to node " CS_PRI_NODE_ID " is now %s", nodename, our_nodeid, iface_no, nodeid, state);
 }
 
 static void
@@ -920,24 +1033,24 @@ _cs_local_node_info_get(char **nodename, uint32_t *nodeid)
 	cs_error_t rc;
 	corosync_cfg_handle_t cfg_handle;
 
-	if (local_nodeid == 0) {
+	if (g_local_nodeid == 0) {
 		rc = corosync_cfg_initialize(&cfg_handle, NULL);
 		if (rc != CS_OK) {
 			syslog (LOG_ERR, "Failed to initialize the cfg API. Error %d\n", rc);
 			exit (EXIT_FAILURE);
 		}
 
-		rc = corosync_cfg_local_get (cfg_handle, &local_nodeid);
+		rc = corosync_cfg_local_get (cfg_handle, &g_local_nodeid);
 		corosync_cfg_finalize(cfg_handle);
 		if (rc != CS_OK) {
-			local_nodeid = 0;
+			g_local_nodeid = 0;
 			strncpy(local_nodename, "localhost", sizeof (local_nodename));
 			local_nodename[sizeof (local_nodename) - 1] = '\0';
 		} else {
 			gethostname(local_nodename, CS_MAX_NAME_LENGTH);
 		}
 	}
-	*nodeid = local_nodeid;
+	*nodeid = g_local_nodeid;
 	*nodename = local_nodename;
 }
 
@@ -974,17 +1087,17 @@ _cs_application_connection_event(char *app_name, const char *state)
 }
 
 static void
-_cs_rrp_faulty_event(uint32_t iface_no, const char *state)
+_cs_link_faulty_event(uint32_t nodeid, uint32_t iface_no, const char *state)
 {
 	int i;
 	char *nodename;
-	uint32_t nodeid;
+	uint32_t our_nodeid;
 
-	_cs_local_node_info_get(&nodename, &nodeid);
+	_cs_local_node_info_get(&nodename, &our_nodeid);
 
 	for (i = 0; i < num_notifiers; i++) {
-		if (notifiers[i].rrp_faulty_fn) {
-			notifiers[i].rrp_faulty_fn(nodename, nodeid, iface_no, state);
+		if (notifiers[i].link_faulty_fn) {
+			notifiers[i].link_faulty_fn(nodename, our_nodeid, nodeid, iface_no, state);
 		}
 	}
 }
@@ -996,60 +1109,131 @@ sig_exit_handler(int32_t num, void *data)
 	return 0;
 }
 
+static void track_link_updown_events(void)
+{
+	cmap_iter_handle_t iter_handle;
+	cmap_track_handle_t track_handle;
+
+	char key_name[CMAP_KEYNAME_MAXLEN + 1];
+	size_t value_len;
+	cmap_value_types_t type;
+	cs_error_t err;
+	struct track_item *track_item;
+
+	err = cmap_iter_init(stats_handle, "stats.knet.", &iter_handle);
+	if (err != CS_OK) {
+		fprintf (stderr, "Failed to initialize knet stats iterator. Error %s\n", cs_strerror(err));
+		exit (EXIT_FAILURE);
+	}
+
+	while ((err = cmap_iter_next(stats_handle, iter_handle, key_name, &value_len, &type)) == CS_OK) {
+		if (strstr(key_name, ".connected")) {
+
+			track_item = malloc(sizeof(struct track_item));
+			if (!track_item) {
+				return;
+			}
+
+			if ((err = cmap_track_add(stats_handle, key_name, CMAP_TRACK_MODIFY, _cs_cmap_link_faulty_key_changed, NULL, &track_handle)) != CS_OK) {
+				fprintf (stderr, "Failed to add tracker for %s. Error %s\n", key_name, cs_strerror(err));
+				exit (EXIT_FAILURE);
+			}
+			strcpy(track_item->key_name, key_name);
+			track_item->track_handle = track_handle;
+			qb_map_put(tracker_map, track_item->key_name, track_item);
+		}
+	}
+	cmap_iter_finalize(stats_handle, iter_handle);
+}
+
 static void
 _cs_cmap_init(void)
 {
-	cs_error_t rc;
+	cs_error_t rc = CS_OK;
 	int cmap_fd = 0;
-	cmap_track_handle_t track_handle;
+	int stats_fd = 0;
 
-	rc = cmap_initialize (&cmap_handle);
+	tracker_map = qb_trie_create();
+	if (!tracker_map) {
+		qb_log(LOG_ERR, "Failed to initialize the track map. Error %d", rc);
+		exit (EXIT_FAILURE);
+	}
+
+	rc = cmap_initialize_map (&cmap_handle, CMAP_MAP_ICMAP);
 	if (rc != CS_OK) {
 		qb_log(LOG_ERR, "Failed to initialize the cmap API. Error %d", rc);
 		exit (EXIT_FAILURE);
 	}
 	cmap_fd_get(cmap_handle, &cmap_fd);
 
-	qb_loop_poll_add(main_loop, QB_LOOP_MED, cmap_fd, POLLIN|POLLNVAL, NULL,
+	qb_loop_poll_add(main_loop, QB_LOOP_MED, cmap_fd, POLLIN|POLLNVAL, (void*)&cmap_handle,
 		_cs_cmap_dispatch);
 
-	rc = cmap_track_add(cmap_handle, "runtime.connections.",
+
+	rc = cmap_initialize_map (&stats_handle, CMAP_MAP_STATS);
+	if (rc != CS_OK) {
+		qb_log(LOG_ERR, "Failed to initialize the cmap stats API. Error %d", rc);
+		exit (EXIT_FAILURE);
+	}
+	cmap_fd_get(stats_handle, &stats_fd);
+
+	qb_loop_poll_add(main_loop, QB_LOOP_MED, stats_fd, POLLIN|POLLNVAL, (void*)&stats_handle,
+		_cs_cmap_dispatch);
+
+
+	rc = cmap_track_add(cmap_handle, "runtime.members.",
+			CMAP_TRACK_ADD | CMAP_TRACK_MODIFY | CMAP_TRACK_PREFIX,
+			_cs_cmap_members_key_changed,
+			NULL,
+			&cmap_track_handle_runtime_members_key_changed);
+	if (rc != CS_OK) {
+		qb_log(LOG_ERR,
+			"Failed to track the members key. Error %d", rc);
+		exit (EXIT_FAILURE);
+	}
+
+	rc = cmap_track_add(stats_handle, "stats.ipcs.",
 			CMAP_TRACK_ADD | CMAP_TRACK_DELETE | CMAP_TRACK_PREFIX,
 			_cs_cmap_connections_key_changed,
 			NULL,
-			&track_handle);
+			&cmap_track_handle_stats_ipcs_key_changed);
 	if (rc != CS_OK) {
 		qb_log(LOG_ERR,
 			"Failed to track the connections key. Error %d", rc);
 		exit (EXIT_FAILURE);
 	}
 
-	rc = cmap_track_add(cmap_handle, "runtime.totem.pg.mrp.srp.members.",
-			CMAP_TRACK_ADD | CMAP_TRACK_MODIFY | CMAP_TRACK_PREFIX,
-			_cs_cmap_members_key_changed,
+	rc = cmap_track_add(stats_handle, "stats.knet.",
+			CMAP_TRACK_ADD | CMAP_TRACK_DELETE | CMAP_TRACK_PREFIX,
+			_cs_cmap_link_added_removed,
 			NULL,
-			&track_handle);
+			&cmap_track_handle_stats_knet_key_changed);
 	if (rc != CS_OK) {
 		qb_log(LOG_ERR,
-			"Failed to track the members key. Error %d", rc);
+			"Failed to track the knet link status key. Error %d", rc);
 		exit (EXIT_FAILURE);
 	}
-	rc = cmap_track_add(cmap_handle, "runtime.totem.pg.mrp.rrp.",
-			CMAP_TRACK_ADD | CMAP_TRACK_MODIFY | CMAP_TRACK_PREFIX,
-			_cs_cmap_rrp_faulty_key_changed,
-			NULL,
-			&track_handle);
-	if (rc != CS_OK) {
-		qb_log(LOG_ERR,
-			"Failed to track the rrp key. Error %d", rc);
-		exit (EXIT_FAILURE);
-	}
+	track_link_updown_events();
 }
 
 static void
 _cs_cmap_finalize(void)
 {
+	struct qb_map_iter *map_iter;
+	struct track_item *track_item;
+
+	map_iter = qb_map_iter_create(tracker_map);
+	while (qb_map_iter_next(map_iter, (void **)&track_item) != NULL) {
+		cmap_track_delete(stats_handle, track_item->track_handle);
+		free(track_item);
+	}
+	qb_map_iter_free(map_iter);
+
+	cmap_track_delete(cmap_handle, cmap_track_handle_runtime_members_key_changed);
+	cmap_track_delete(stats_handle, cmap_track_handle_stats_ipcs_key_changed);
+	cmap_track_delete(stats_handle, cmap_track_handle_stats_knet_key_changed);
 	cmap_finalize (cmap_handle);
+	cmap_finalize (stats_handle);
 }
 
 static void
@@ -1089,13 +1273,15 @@ static void
 _cs_usage(void)
 {
 	fprintf(stderr,	"usage:\n"\
+		"        -c     : SNMP Community name.\n"\
 		"        -f     : Start application in foreground.\n"\
 		"        -l     : Log all events.\n"\
 		"        -o     : Print events to stdout (turns on -l).\n"\
 		"        -s     : Send SNMP traps on all events.\n"\
-		"        -m     : SNMP Manager IP address (defaults to localhost).\n"\
+		"        -m     : Set the SNMP Manager IP address (defaults to localhost).\n"\
+		"        -n     : No reverse DNS lookup on cmap member change events.\n"\
 		"        -d     : Send DBUS signals on all events.\n"\
-		"        -h     : Print this help\n\n");
+		"        -h     : Print this help.\n\n");
 }
 
 int
@@ -1109,8 +1295,13 @@ main(int argc, char *argv[])
 	conf[CS_NTF_SNMP] = QB_FALSE;
 	conf[CS_NTF_DBUS] = QB_FALSE;
 
-	while ((ch = getopt (argc, argv, "floshdm:")) != EOF) {
+	while ((ch = getopt (argc, argv, "c:floshdnm:")) != EOF) {
 		switch (ch) {
+			case 'c':
+				strncpy(snmp_community_buf, optarg, sizeof (snmp_community_buf));
+				snmp_community_buf[sizeof (snmp_community_buf) - 1] = '\0';
+				snmp_community = snmp_community_buf;
+				break;
 			case 'f':
 				conf[CS_NTF_FG] = QB_TRUE;
 				break;
@@ -1122,6 +1313,9 @@ main(int argc, char *argv[])
 				strncpy(snmp_manager_buf, optarg, sizeof (snmp_manager_buf));
 				snmp_manager_buf[sizeof (snmp_manager_buf) - 1] = '\0';
 				snmp_manager = snmp_manager_buf;
+				break;
+			case 'n':
+				conf[CS_NTF_NODNS] = QB_TRUE;
 				break;
 			case 'o':
 				conf[CS_NTF_LOG] = QB_TRUE;
@@ -1165,8 +1359,8 @@ main(int argc, char *argv[])
 			_cs_syslog_node_quorum_event;
 		notifiers[num_notifiers].application_connection_fn =
 			_cs_syslog_application_connection_event;
-		notifiers[num_notifiers].rrp_faulty_fn =
-			_cs_syslog_rrp_faulty_event;
+		notifiers[num_notifiers].link_faulty_fn =
+			_cs_syslog_link_faulty_event;
 		num_notifiers++;
 	}
 
@@ -1206,6 +1400,10 @@ main(int argc, char *argv[])
 			   sig_exit_handler,
 			   NULL);
 
+#ifdef HAVE_LIBSYSTEMD
+	sd_notify (0, "READY=1");
+#endif
+
 	qb_loop_run(main_loop);
 
 #ifdef HAVE_DBUS
@@ -1217,6 +1415,6 @@ main(int argc, char *argv[])
 	_cs_quorum_finalize();
 	_cs_cmap_finalize();
 
-	return 0;
+	return (exit_code);
 }
 

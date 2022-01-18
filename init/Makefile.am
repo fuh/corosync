@@ -35,36 +35,31 @@
 MAINTAINERCLEANFILES	= Makefile.in
 
 EXTRA_DIST		= corosync.in corosync-notifyd.in corosync.service.in \
-                          corosync-notifyd.service.in corosync.conf.in corosync-notifyd.conf.in \
+                          corosync-notifyd.service.in \
                           corosync.sysconfig.example
 
 if INSTALL_SYSTEMD
 systemdconfdir	   = $(SYSTEMDDIR)
 systemdconf_DATA   = corosync.service corosync-notifyd.service
-initscriptdir	   = $(INITWRAPPERSDIR)
 else
 initscriptdir	   = $(INITDDIR)
-endif
 initscript_SCRIPTS  = corosync corosync-notifyd
-
-if INSTALL_UPSTART
-upstartconfdir     = $(UPSTARTDIR)
-upstartconf_DATA   = corosync.conf corosync-notifyd.conf
 endif
 
 %: %.in Makefile
 	rm -f $@-t $@
-	cat $< | sed \
+	cat $< | $(SED) \
 		-e 's#@''SBINDIR@#$(sbindir)#g' \
+		-e 's#@''BINDIR@#$(bindir)#g' \
 		-e 's#@''SYSCONFDIR@#$(sysconfdir)#g' \
+		-e 's#@''INITCONFIGDIR@#$(INITCONFIGDIR)#g' \
 		-e 's#@''INITDDIR@#$(INITDDIR)#g' \
-		-e 's#@''INITWRAPPERSDIR@#$(INITWRAPPERSDIR)#g' \
 		-e 's#@''LOCALSTATEDIR@#$(localstatedir)#g' \
 		-e 's#@''BASHPATH@#${BASHPATH}#g' \
 	    > $@-t
 	mv $@-t $@
 
-all-local: $(initscript_SCRIPTS) $(systemdconf_DATA) $(upstartconf_DATA)
+all-local: $(initscript_SCRIPTS) $(systemdconf_DATA)
 
 clean-local:
-	rm -rf $(initscript_SCRIPTS) $(systemdconf_DATA) $(upstartconf_DATA)
+	rm -rf $(initscript_SCRIPTS) $(systemdconf_DATA)

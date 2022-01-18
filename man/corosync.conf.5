@@ -1,6 +1,6 @@
 .\"/*
 .\" * Copyright (c) 2005 MontaVista Software, Inc.
-.\" * Copyright (c) 2006-2012 Red Hat, Inc.
+.\" * Copyright (c) 2006-2021 Red Hat, Inc.
 .\" *
 .\" * All rights reserved.
 .\" *
@@ -32,7 +32,7 @@
 .\" * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
 .\" * THE POSSIBILITY OF SUCH DAMAGE.
 .\" */
-.TH COROSYNC_CONF 5 2012-10-10 "corosync Man Page" "Corosync Cluster Engine Programmer's Manual"
+.TH COROSYNC_CONF 5 2021-08-11 "corosync Man Page" "Corosync Cluster Engine Programmer's Manual"
 .SH NAME
 corosync.conf - corosync executive configuration file
 
@@ -58,35 +58,73 @@ This top level directive contains configuration options for quorum.
 nodelist { }
 This top level directive contains configuration options for nodes in cluster.
 .TP
-qb { }
-This top level directive contains configuration options related to libqb.
+system { }
+This top level directive contains configuration options related to system.
+.TP
+resources { }
+This top level directive contains configuration options for resources.
+.TP
+nozzle { }
+This top level directive contains configuration options for a libnozzle device.
 
 .PP
-.PP
-Within the
-.B totem
-directive, an interface directive is required.  There is also one configuration
-option which is required:
-.PP
-.PP
-Within the
-.B interface
-sub-directive of totem there are four parameters which are required.  There is
-one parameter which is optional.
+The
+.B interface sub-directive of totem is optional for UDP and knet transports.
+
+For knet, multiple interface subsections define parameters for each knet link on the
+system.
+
+For UDPU an interface section is not needed and it is recommended that the nodelist
+is used to define cluster nodes.
 
 .TP
-ringnumber
-This specifies the ring number for the interface.  When using the redundant
-ring protocol, each interface should specify separate ring numbers to uniquely
-identify to the membership protocol which interface to use for which redundant
-ring. The ringnumber must start at 0.
+linknumber
+This specifies the link number for the interface.  When using the knet
+protocol, each interface should specify separate link numbers to uniquely
+identify to the membership protocol which interface to use for which link.
+The linknumber must start at 0. For UDP the only supported linknumber is 0.
 
 .TP
-bindnetaddr
+knet_link_priority
+This specifies the priority for the link when knet is used in 'passive'
+mode. (see link_mode below)
+
+.TP
+knet_ping_interval
+This specifies the interval between knet link pings.
+knet_ping_interval and knet_ping_timeout
+are a pair, if one is specified the other should be too, otherwise one will be calculated from
+the token timeout and one will be taken from the config file.
+(default is token timeout / (knet_pong_count*2))
+
+.TP
+knet_ping_timeout
+If no ping is received within this time, the knet link is declared dead.
+knet_ping_interval and knet_ping_timeout
+are a pair, if one is specified the other should be too, otherwise one will be calculated from
+the token timeout and one will be taken from the config file.
+(default is token timeout / knet_pong_count)
+
+.TP
+knet_ping_precision
+How many values of latency are used to calculate
+the average link latency. (default 2048 samples)
+
+.TP
+knet_pong_count
+How many valid ping/pongs before a link is marked UP. (default 2)
+.TP
+
+knet_transport
+Which IP transport knet should use. valid values are "sctp" or "udp". (default: udp)
+
+.TP
+bindnetaddr (udp only)
 This specifies the network address the corosync executive should bind
-to.
+to when using udp.
 
-bindnetaddr should be an IP address configured on the system, or a network
+bindnetaddr (udp only)
+should be an IP address configured on the system, or a network
 address.
 
 For example, if the local interface is 192.168.5.92 with netmask
@@ -101,13 +139,13 @@ selection of the network interface within a specific subnet as with IPv4.
 If IPv6 networking is used, the nodeid field in nodelist must be specified.
 
 .TP
-broadcast
+broadcast (udp only)
 This is optional and can be set to yes.  If it is set to yes, the broadcast
 address will be used for communication.  If this option is set, mcastaddr
 should not be set.
 
 .TP
-mcastaddr
+mcastaddr (udp only)
 This is the multicast address used by corosync executive.  The default
 should work for most networks, but the network administrator should be queried
 about a multicast address to use.  Avoid 224.x.x.x because this is a "config"
@@ -117,25 +155,24 @@ This may also be an IPV6 multicast address, in which case IPV6 networking
 will be used.  If IPv6 networking is used, the nodeid field in nodelist must
 be specified.
 
-It's not needed to use this option if cluster_name option is used. If both options
+It's not necessary to use this option if cluster_name option is used. If both options
 are used, mcastaddr has higher priority.
 
 .TP
-mcastport
+mcastport (udp only)
 This specifies the UDP port number.  It is possible to use the same multicast
 address on a network with the corosync services configured for different
 UDP ports.
-Please note corosync uses two UDP ports mcastport (for mcast receives) and 
+Please note corosync uses two UDP ports mcastport (for mcast receives) and
 mcastport - 1 (for mcast sends).
-If you have multiple clusters on the same network using the same mcastaddr 
+If you have multiple clusters on the same network using the same mcastaddr
 please configure the mcastports with a gap.
 
 .TP
-ttl
+ttl (udp only)
 This specifies the Time To Live (TTL). If you run your cluster on a routed
 network then the default of "1" will be too small. This option provides
 a way to increase this up to 255. The valid range is 0..255.
-Note that this is only valid on multicast transport types.
 
 .PP
 .PP
@@ -146,7 +183,7 @@ five are optional, and one is required when IPV6 is configured in the interface
 subdirective.  The required directive controls the version of the totem
 configuration.  The optional option unless using IPV6 directive controls
 identification of the processor.  The optional options control secrecy and
-authentication, the redundant ring mode of operation and maximum network MTU
+authentication, the network mode of operation and maximum network MTU
 field.
 
 .TP
@@ -154,64 +191,85 @@ version
 This specifies the version of the configuration file.  Currently the only
 valid version for this directive is 2.
 
-.PP
+.TP
 clear_node_high_bit
 This configuration option is optional and is only relevant when no nodeid is
 specified.  Some corosync clients require a signed 32 bit nodeid that is greater
 than zero however by default corosync uses all 32 bits of the IPv4 address space
 when generating a nodeid.  Set this option to yes to force the high bit to be
-zero and therefor ensure the nodeid is a positive signed 32 bit integer.
+zero and therefore ensure the nodeid is a positive signed 32 bit integer.
 
-WARNING: The clusters behavior is undefined if this option is enabled on only
+WARNING: Cluster behavior is undefined if this option is enabled on only
 a subset of the cluster (for example during a rolling upgrade).
+
+.TP
+crypto_model
+This specifies which cryptographic library should be used by knet.
+Supported values depend on the libknet build and on the installed
+cryptography libraries. Typically nss and openssl will be available
+but gcrypt and others could also be allowed.
+
+The default is nss.
 
 .TP
 crypto_hash
 This specifies which HMAC authentication should be used to authenticate all
 messages. Valid values are none (no authentication), md5, sha1, sha256,
-sha384 and sha512.
+sha384 and sha512. Encrypted transmission is only supported for
+the knet transport.
 
-The default is sha1.
+The default is none.
 
 .TP
 crypto_cipher
 This specifies which cipher should be used to encrypt all messages.
-Valid values are none (no encryption), aes256, aes192, aes128 and 3des.
-Enabling crypto_cipher, requires also enabling of crypto_hash.
+Valid values are none (no encryption), aes256, aes192 and aes128.
+Enabling crypto_cipher, requires also enabling of crypto_hash. Encrypted
+transmission is only supported for the knet transport.
 
-The default is aes256.
+The default is none.
 
 .TP
 secauth
-This specifies that HMAC/SHA1 authentication should be used to authenticate
-all messages.  It further specifies that all data should be encrypted with the
-nss library and aes256 encryption algorithm to protect data from eavesdropping.
+This implies crypto_cipher=aes256 and crypto_hash=sha256, unless those options
+are explicitly set. Encrypted transmission is only supported for the knet
+transport.
 
-Enabling this option adds a encryption header to every message sent by totem which
-reduces total throughput. Also encryption and authentication consume extra CPU
-cycles in corosync.
-
-The default is on.
-
-WARNING: This parameter is deprecated. It's recomended to use combination of
-crypto_cipher and crypto_hash.
+The default is off.
 
 .TP
-rrp_mode
-This specifies the mode of redundant ring, which may be none, active, or
-passive.  Active replication offers slightly lower latency from transmit
-to delivery in faulty network environments but with less performance.
-Passive replication may nearly double the speed of the totem protocol
-if the protocol doesn't become cpu bound.  The final option is none, in
-which case only one network interface will be used to operate the totem
-protocol.
+keyfile
+This specifies the fully qualified path to the shared key used to
+authenticate and encrypt data used within the Totem protocol.
 
-If only one interface directive is specified, none is automatically chosen.
-If multiple interface directives are specified, only active or passive may
-be chosen.
+The default is /etc/corosync/authkey.
 
-The maximum number of interface directives that is allowed for either 
-modes (active or passive) is 2.
+.TP
+key
+Shared key stored in configuration instead of authkey file. This option
+has lower precedence than keyfile option so it's
+used only when keyfile is not specified.
+Using this option is not recommended for security reasons.
+
+.TP
+link_mode
+This specifies the Kronosnet mode, which may be passive, active, or
+rr (round-robin).
+.B passive:
+the active link with the highest priority (highest number) will be used. If one or more
+links share the same priority the one with the lowest link ID will
+be used.
+.B active:
+All active links will be used simultaneously to send traffic.
+link priority is ignored.
+.B rr:
+Round-Robin policy. Each packet will be sent to the next active link in
+order.
+
+If only one interface directive is specified, passive is automatically chosen.
+
+The maximum number of interface directives that is allowed with Kronosnet
+is 8. For other transports it is 1.
 
 .TP
 netmtu
@@ -239,14 +297,9 @@ The default is 1500.
 
 .TP
 transport
-This directive controls the transport mechanism used.  If the interface to
-which corosync is binding is an RDMA interface such as RoCEE or Infiniband, the
-"iba" parameter may be specified.  To avoid the use of multicast entirely, a
-unicast transport parameter "udpu" can be specified.  This requires specifying
-the list of members in nodelist directive, that could potentially make up
-the membership before deployment.
-
-The default is udp.  The transport type can also be set to udpu or iba.
+This directive controls the transport mechanism used.
+The default is knet.  The transport type can also be set to udpu or udp.
+Only knet allows crypto or multiple interfaces per node.
 
 .TP
 cluster_name
@@ -265,9 +318,29 @@ equal to highest of collected versions, corosync is terminated.
 
 .TP
 ip_version
-Specifies version of IP to use for communication. Value can be one of
-ipv4 or ipv6. Default (if unspecified) is ipv4.
+This specifies version of IP to ask DNS resolver for.
+The value can be one of
+.B ipv4
+(look only for an IPv4 address)
+,
+.B ipv6
+(check only IPv6 address)
+,
+.B ipv4-6
+(look for all address families and use first IPv4 address found in the list if there is such address,
+otherwise use first IPv6 address) and
+.B ipv6-4
+(look for all address families and use first IPv6 address found in the list if there is such address,
+otherwise use first IPv4 address).
 
+Default (if unspecified) is
+.B ipv6-4
+for knet and udpu transports and
+.B ipv4
+for udp.
+
+The knet transport supports IPv4 and IPv6 addresses concurrently,
+provided they are consistent on each link.
 
 Within the
 .B totem
@@ -288,10 +361,21 @@ in the current configuration.  Reforming a new configuration takes about 50
 milliseconds in addition to this timeout.
 
 For real token timeout used by totem it's possible to read cmap value of
-.B runtime.config.token
+.B runtime.config.totem.token
 key.
 
-The default is 1000 milliseconds.
+Be careful to use the same timeout values on each of the nodes in the cluster
+or unpredictable results may occur.
+
+The default is 3000 milliseconds.
+
+.TP
+token_warning
+Specifies the interval between warnings that the token has not been received.  The
+value is a percentage of the token timeout and can be set to 0 to disable
+warnings.
+
+The default is 75%.
 
 .TP
 token_coefficient
@@ -312,7 +396,32 @@ the token is retransmitted.  This will be automatically calculated if token
 is modified.  It is not recommended to alter this value without guidance from
 the corosync community.
 
-The default is 238 milliseconds.
+The minimum is 30 milliseconds. If not set and error occur, make sure
+token / (token_retransmits_before_loss_const + 0.2) is more than 30.
+
+The default is 238 milliseconds for two nodes cluster. Three or more nodes reference
+.B token_coefficient.
+
+.TP
+knet_compression_model
+Type of compression used by Kronosnet. Supported values depend on
+the libknet build and on the installed compression libraries. Typically zlib and lz4 will be available
+but bzip2 and others could also be allowed. The default is 'none'.
+
+.TP
+knet_compression_threshold
+Tells knet to NOT compress any packets that are smaller than the value
+indicated. Default 100 bytes.
+
+Set to 0 to reset to the default.
+Set to 1 to compress everything.
+
+.TP
+knet_compression_level
+Many compression libraries allow tuning of compression parameters. For example
+0 or 1 ... 9 are commonly used to determine the level of compression. This value
+is passed unmodified to the compression library so it is recommended to consult
+the library's documentation for more detailed information.
 
 .TP
 hold
@@ -325,8 +434,8 @@ The default is 180 milliseconds.
 .TP
 token_retransmits_before_loss_const
 This value identifies how many token retransmits should be attempted before
-forming a new configuration.  If this value is set, retransmit and hold will
-be automatically calculated from retransmits_before_loss and token.
+forming a new configuration. It is also used for token_retransmit
+and hold calculations.
 
 The default is 4 retransmissions.
 
@@ -340,7 +449,7 @@ The default is 50 milliseconds.
 .TP
 send_join
 This timeout specifies in milliseconds an upper range between 0 and send_join
-to wait before sending a join message.  For configurations with less then
+to wait before sending a join message.  For configurations with less than
 32 nodes, this parameter is not necessary.  For larger rings, this parameter
 is necessary to ensure the NIC is not overflowed with join messages on
 formation of a new ring.  A reasonable value for large rings (128 nodes) would
@@ -356,13 +465,13 @@ achieved before starting a new round of membership configuration.  The minimum
 value for consensus must be 1.2 * token.  This value will be automatically
 calculated at 1.2 * token if the user doesn't specify a consensus value.
 
-For two node clusters, a consensus larger then the join timeout but less then
+For two node clusters, a consensus larger than the join timeout but less than
 token is safe.  For three node or larger clusters, consensus should be larger
-then token.  There is an increasing risk of odd membership changes, which stil
+than token.  There is an increasing risk of odd membership changes, which still
 guarantee virtual synchrony,  as node count grows if consensus is less than
 token.
 
-The default is 1200 milliseconds.
+The default is 3600 milliseconds.
 
 .TP
 merge
@@ -378,7 +487,7 @@ downcheck
 This timeout specifies in milliseconds how long to wait before checking
 that a network interface is back up after it has been downed.
 
-The default is 1000 millseconds.
+The default is 1000 milliseconds.
 
 .TP
 fail_recv_const
@@ -417,7 +526,7 @@ max_network_delay
 [HeartBeating mechanism]
 This constant specifies in milliseconds the approximate delay that your network takes
 to transport one packet from one machine to another. This value is to be set by system
-engineers and please dont change if not sure as this effects the failure detection
+engineers and please don't change if not sure as this effects the failure detection
 mechanism using heartbeat.
 
 The default is 50 milliseconds.
@@ -429,7 +538,7 @@ token rotation.  If all processors perform equally well, this value could be
 large (300), which would introduce higher latency from origination to delivery
 for very large rings.  To reduce latency in large rings(16+), the defaults are
 a safe compromise.  If 1 or more slow processor(s) are present among fast
-processors, window_size should be no larger then 256000 / netmtu to avoid
+processors, window_size should be no larger than 256000 / netmtu to avoid
 overflow of the kernel receive buffers.  The user is notified of this by
 the display of a retransmit list in the notification logs.  There is no loss
 of data, but performance is reduced when these errors occur.
@@ -455,54 +564,38 @@ modern switches.
 The default is 5 messages.
 
 .TP
-rrp_problem_count_timeout
-This specifies the time in milliseconds to wait before decrementing the
-problem count by 1 for a particular ring to ensure a link is not marked
-faulty for transient network failures.
-
-The default is 2000 milliseconds.
+knet_pmtud_interval
+How often the knet PMTUd runs to look for network MTU changes.
+Value in seconds, default: 30
 
 .TP
-rrp_problem_count_threshold
-This specifies the number of times a problem is detected with a link before
-setting the link faulty.  Once a link is set faulty, no more data is
-transmitted upon it.  Also, the problem counter is no longer decremented when
-the problem count timeout expires.
+block_unlisted_ips
+Allow UDPU and KNET to drop packets from IP addresses that are not known
+(nodes which don't exist in the nodelist) to corosync.
+Value is yes or no.
 
-A problem is detected whenever all tokens from the proceeding processor have
-not been received within the rrp_token_expired_timeout.  The
-rrp_problem_count_threshold * rrp_token_expired_timeout should be atleast 50
-milliseconds less then the token timeout, or a complete reconfiguration
-may occur.
+This feature is mainly to protect against the joining of nodes
+with outdated configurations after a cluster split.
+Another use case is to allow the atomic merge of two independent clusters.
 
-The default is 10 problem counts.
+Changing the default value is not recommended, the overhead is tiny and
+an existing cluster may fail if corosync is started on an unlisted node
+with an old configuration.
 
-.TP
-rrp_problem_count_mcast_threshold
-This specifies the number of times a problem is detected with multicast before
-setting the link faulty for passive rrp mode. This variable is unused in active
-rrp mode.
-
-The default is 10 times rrp_problem_count_threshold.
+The default value is yes.
 
 .TP
-rrp_token_expired_timeout
-This specifies the time in milliseconds to increment the problem counter for
-the redundant ring protocol after not having received a token from all rings
-for a particular processor.
+cancel_token_hold_on_retransmit
+Allows Corosync to hold token by representative when there is too much
+retransmit messages. This allows network to process increased load without
+overloading it. Used mechanism is same as described for
+.B hold
+directive.
 
-This value will automatically be calculated from the token timeout and
-problem_count_threshold but may be overridden.  It is not recommended to
-override this value without guidance from the corosync community.
+Some deployments may prefer to never hold token when there is
+retransmit messages. If so, option should be set to yes.
 
-The default is 47 milliseconds.
-
-.TP
-rrp_autorecovery_check_timeout
-This specifies the time in milliseconds to check if the failed ring can be
-auto-recovered.
-
-The default is 1000 milliseconds.
+The default value is no.
 
 .PP
 Within the
@@ -514,9 +607,11 @@ The following 3 options are valid only for the top level logging directive:
 
 .TP
 timestamp
-This specifies that a timestamp is placed on all log messages.
+This specifies that a timestamp is placed on all log messages. It can be one
+of off (no timestamp), on (second precision timestamp) or
+hires (millisecond precision timestamp - only when supported by LibQB).
 
-The default is off.
+The default is hires (or on if hires is not supported).
 
 .TP
 fileline
@@ -530,9 +625,15 @@ This specifies that the code function name should be printed.
 
 The default is off.
 
+.TP
+blackbox
+This specifies that blackbox functionality should be enabled.
+
+The default is on.
+
 .PP
 The following options are valid both for top level logging directive
-and they can be overriden in logger_subsys entries.
+and they can be overridden in logger_subsys entries.
 
 .TP
 to_stderr
@@ -549,7 +650,7 @@ and
 The default is syslog and stderr.
 
 Please note, if you are using to_logfile and want to rotate the file, use logrotate(8)
-with the option 
+with the option
 .B
 copytruncate.
 eg.
@@ -604,7 +705,7 @@ The default is: info.
 .TP
 debug
 This specifies whether debug output is logged for this particular logger. Also can contain
-value trace, what is highest level of debug informations.
+value trace, what is highest level of debug information.
 
 The default is off.
 
@@ -623,7 +724,7 @@ The subsys entry, described below, is mandatory to identify the subsystem.
 .TP
 subsys
 This specifies the subsystem identity (name) for which logging is specified. This is the
-name used by a service in the log_init () call. E.g. 'CPG'. This directive is
+name used by a service in the log_init() call. E.g. 'CPG'. This directive is
 required.
 
 .PP
@@ -639,40 +740,295 @@ See votequorum(5) for configuration options.
 .PP
 Within the
 .B nodelist
-directive it is possible to specify specific informations about nodes in cluster. Directive
+directive it is possible to specify specific information about nodes in cluster. Directive
 can contain only
 .B node
 sub-directive, which specifies every node that should be a member of the membership, and where
 non-default options are needed. Every node must have at least ring0_addr field filled.
 
-For UDPU, every node that should be a member of the membership must be specified.
+Every node that should be a member of the membership must be specified.
 
 Possible options are:
 .TP
 ringX_addr
-This specifies ip address of one of the nodes. X is ring number.
+This specifies IP or network hostname address of the particular node.
+X is a link number.
 
 .TP
 nodeid
-This configuration option is optional when using IPv4 and required when using
-IPv6.  This is a 32 bit value specifying the node identifier delivered to the
-cluster membership service.  If this is not specified with IPv4, the node id
-will be determined from the 32 bit IP address the system to which the system
-is bound with ring identifier of 0.  The node identifier value of zero is
-reserved and should not be used.
+This configuration option is required for each node for Kronosnet mode.
+It is a 32 bit value specifying the node identifier delivered to the
+cluster membership service. The node identifier value of zero is
+reserved and should not be used. If knet is set, this field must be set.
+
+.TP
+name
+This option is used mainly with knet transport to identify local node.
+It's also used by client software (pacemaker).
+Algorithm for identifying local node is following:
+.RS
+.IP 1.
+Looks up $HOSTNAME in the nodelist
+.IP 2.
+If this fails strip the domain name from $HOSTNAME and looks up
+that in the nodelist
+.IP 3.
+If this fails look in the nodelist for a fully-qualified name whose
+short version matches the short version of $HOSTNAME
+.IP 4.
+If all this fails then search the interfaces list for an address that
+matches a name in the nodelist
+.RE
 
 .PP
 Within the
-.B qb
-directive it is possible to specify options for libqb.
+.B system
+directive it is possible to specify system options.
 
-Possible option is:
+Possible options are:
 .TP
-ipc_type
+qb_ipc_type
 This specifies type of IPC to use. Can be one of native (default), shm and socket.
 Native means one of shm or socket, depending on what is supported by OS. On systems
 with support for both, SHM is selected. SHM is generally faster, but need to allocate
 ring buffer file in /dev/shm.
+
+.TP
+sched_rr
+Should be set to yes (default) if corosync should try to set round robin realtime
+scheduling with maximal priority to itself. When setting of scheduler fails, fallback to set
+maximal priority.
+
+.TP
+priority
+Set priority of corosync process. Valid only when sched_rr is set to no.
+Can be ether numeric value with similar meaning as
+.BR nice (1)
+or
+.B max
+/
+.B min
+meaning maximal / minimal priority (so minimal / maximal nice value).
+
+.TP
+move_to_root_cgroup
+Can be one of
+.B yes
+(Corosync always moves itself to root cgroup),
+.B no
+(Corosync never tries to move itself to root cgroup) or
+.B auto
+(Corosync first checks if sched_rr is enabled, and if
+so, it tries to set round robin realtime scheduling with maximal priority to itself.
+If setting of priority fails, corosync tries to move itself to root
+cgroup and retries setting of priority).
+
+This feature is available only for systems with cgroups v1 with RT
+sched enabled (Linux with CONFIG_RT_GROUP_SCHED kernel option) and cgroups v2.
+
+It's worth noting that currently (May 3 2021) cgroup2 doesn’t yet
+support control of realtime processes and the cpu controller can only be
+enabled when all RT processes are in the root cgroup (applies only for kernel
+with CONFIG_RT_GROUP_SCHED enabled). So when move_to_root_cgroup
+is disabled, kernel is compiled with CONFIG_RT_GROUP_SCHED and systemd is used,
+it may be impossible to make systemd options
+like CPUQuota working correctly until corosync is stopped.
+
+Also when moving to root cgroup is enforced and used together with cgroup2 and systemd
+it makes impossible (most of the time) for journald to add systemd specific
+metadata (most importantly _SYSTEMD_UNIT) properly, because corosync is
+moved out of cgroup created by systemd. This means
+it is not possible to filter corosync logged messages based on these metadata
+(for example using -u or _SYSTEMD_UNIT=UNIT pattern) and also running
+systemctl status doesn't display (all) corosync log messages.
+The problem is even worse because journald caches pid for some time
+(approx. 5 sec) so initial corosync messages have correct metadata.
+
+.TP
+allow_knet_handle_fallback
+If knet handle creation fails using privileged operations, allow fallback to
+creating knet handle using unprivileged operations. Defaults to no, meaning
+if privileged knet handle creation fails, corosync will refuse to start.
+
+The knet handle will always be created using privileged operations if possible,
+setting this to yes only allows fallback to unprivileged operations. This fallback
+may result in performance issues, but if running in an unprivileged environment,
+e.g. as a normal user or in unprivileged container, this may be required.
+
+.TP
+state_dir
+Existing directory where corosync should chdir into. Corosync stores
+important state files and blackboxes there.
+
+The default is /var/lib/corosync.
+
+.PP
+Within the
+.B resources
+directive it is possible to specify options for resources.
+
+Possible option is:
+.TP
+watchdog_device
+(Valid only if Corosync was compiled with watchdog support.)
+.br
+Watchdog device to use, for example /dev/watchdog.
+If unset, empty or "off", no watchdog is used.
+.IP
+In a cluster with properly configured power fencing a watchdog
+provides no additional value.  On the other hand, slow watchdog
+communication may incur multi-second delays in the Corosync main loop,
+potentially breaking down membership.  IPMI watchdogs are particularly
+notorious in this regard: read about kipmid_max_busy_us in IPMI.txt in
+the Linux kernel documentation.
+
+
+.PP
+Within the
+.B nozzle
+directive it is possible to specify options for a libnozzle device. This is a pseudo
+ethernet device that routes network traffic through a channel on the corosync knet network
+(NOT cpg or any corosync internal service) to other nodes in the cluster. This allows
+applications to take advantage of knet features such as multipathing, automatic failover,
+link switching etc. Note that libnozzle is not a reliable transport, but you can tunnel TCP
+through it for reliable communications.
+.br
+libnozzle also supports optional interface up/down scripts that are kept under a
+/etc/corosync/updown.d/ directory. See the knet documentation for more information.
+.br
+Only one nozzle device is allowed.
+.br
+The nozzle stanza takes several options:
+.TP
+name
+The name of the network device to be created. On Linux this may be any name at all, other
+platforms have restrictions on the name.
+.TP
+ipaddr
+The IP address (IPv6 or IPv4) of the interface. The bottom part of this address will be replaced
+by the local node's nodeid in conjunction with ipprefix. so, eg
+ipaddr: 192.168.1.0
+ipprefix: 24
+will make nodeids 1,2,5 use IP addresses 192.168.1.1, 192.168.1.2 & 192.168.1.5.
+If a prefix length of 16 is used then the bottom two bytes will be filled in with nodeid numbers.
+IPv6 addresses must end in '::', the nodeid will be added after the two colons to make the
+local IP address.
+Only one IP address is currently supported in the corosync.conf file. Additional IP addresses
+can be added in the ifup script if necessary.
+.TP
+ipprefix
+specifies the IP address prefix for the nozzle device (see above)
+.TP
+macaddr
+Specifies the MAC address prefix for the nozzle device. As for the IP address, the bottom part
+of the MAC address will be filled in with the node id. In this case no prefix applies, the bottom
+two bytes of the MAC address will always be overwritten with the node id. So specifying
+macaddr: 54:54:12:24:12:12 on nodeid 1 will result in it having a MAC address of 54:54:12:24:00:01
+
+.SH "TO ADD A NEW NODE TO THE CLUSTER"
+For example to add a node with address 10.24.38.108 with nodeid 3. The node has the name NEW
+(in DNS or /etc/hosts) and is not currently running corosync. The current corosync.conf nodelist
+looks like this:
+.PP
+.nf
+.RS
+nodelist {
+    node {
+        nodeid: 1
+        ring0_addr: 10.24.38.101
+        name: node1
+    }
+    node {
+        nodeid: 2
+        ring0_addr: 10.24.38.102
+        name: node2
+
+    }
+}
+.RE
+.fi
+.PP
+Add a new entry for the node below the existing nodes. Node entries don't have
+to be in nodeid order, but it will help keep you sane. So the nodelist now looks like this:
+.PP
+.nf
+.RS
+nodelist {
+    node {
+        nodeid: 1
+        ring0_addr: 10.24.38.101
+        name: node1
+    }
+    node {
+        nodeid: 2
+        ring0_addr: 10.24.38.102
+        name: node2
+
+    }
+    node {
+        nodeid: 3
+        ring0_addr: 10.24.38.108
+        name: NEW
+
+    }
+}
+.RE
+.fi
+.PP
+
+.PP
+This file must then be copied onto all three nodes -  the existing two nodes, and the new one.
+On one of the existing corosync nodes, tell corosync to re-read the updated config file into memory:
+.PP
+.nf
+.RS
+corosync-cfgtool -R
+.RE
+.fi
+.PP
+This command only needs to be run on one node in the cluster. You may then start corosync on the NEW node
+and it should join the cluster. If this doesn't work as expected then check the communications between all
+three nodes is working, and check the syslog files on all nodes for more information. It's important to note
+that the key bit of information about a node failing to join might be on a different node than you expect.
+
+.SH "TO REMOVE A NODE FROM THE CLUSTER"
+This is the reverse procedure to 'Adding a node' above. First you need to shut down the node you will
+be removing from the cluster.
+.PP
+.nf
+.RS
+corosync-cfgtool -H
+.RE
+.fi
+
+
+.PP
+Then delete the nodelist stanza from corosync.conf and finally update corosync on the remaining nodes by
+running
+.PP
+.nf
+.RS
+corosync-cfgtool -R
+.RE
+.fi
+.TP
+on one of them.
+
+.SH "ADDRESS RESOLUTION"
+corosync resolves ringX_addr names/IP addresses using the getaddrinfo(3) call with respect
+of totem.ip_version setting.
+
+getaddrinfo() function uses a sophisticated algorithm to sort node addresses into a preferred
+order and corosync always chooses the first address in that list of the required family.
+As such it is essential that your DNS or /etc/hosts files are correctly configured so that
+all addresses for ringX appear on the same network (or are reachable with minimal hops)
+and over the same IP protocol. If this is not the case then some nodes might not be able
+to join the cluster. It is possible to override the search order used
+by getaddrinfo() using the configuration file /etc/gai.conf(5) if necessary,
+but this is not recommended.
+
+If there is any doubt about the order of addresses returned from getaddrinfo() then it might be simpler to use
+IP addresses (v4 or v6) in the ringX_addr field.
 
 .SH "FILES"
 .TP
@@ -680,7 +1036,10 @@ ring buffer file in /dev/shm.
 The corosync executive configuration file.
 
 .SH "SEE ALSO"
-.BR corosync_overview (8),
+.BR corosync_overview (7),
 .BR votequorum (5),
+.BR corosync-qdevice (8),
 .BR logrotate (8)
+.BR getaddrinfo (3)
+.BR gai.conf (5)
 .PP

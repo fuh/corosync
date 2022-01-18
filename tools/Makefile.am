@@ -42,36 +42,49 @@ if INSTALL_XMLCONF
 bin_SCRIPTS		+= corosync-xmlproc
 endif
 
-EXTRA_DIST		= $(bin_SCRIPTS) corosync-xmlproc.sh \
+noinst_HEADERS          = util.h
+
+AM_CFLAGS		= $(knet_CFLAGS)
+
+EXTRA_DIST		= corosync-xmlproc.sh \
 			  corosync-notifyd.sysconfig.example \
                           corosync-blackbox.sh
 
+corosync_cfgtool_SOURCES = corosync-cfgtool.c util.c
+
+corosync_quorumtool_SOURCES = corosync-quorumtool.c util.c
+
 corosync-xmlproc: corosync-xmlproc.sh
-	sed -e 's#@''DATADIR@#${datadir}#g' \
-	    -e 's#@''BASHPATH@#${BASHPATH}#g' \
-	    $< > $@
+	$(SED) -e 's#@''DATADIR@#${datadir}#g' \
+	       -e 's#@''BASHPATH@#${BASHPATH}#g' \
+	       $< > $@
 
 corosync-blackbox: corosync-blackbox.sh
-	sed -e 's#@''LOCALSTATEDIR@#${localstatedir}#g' $< > $@
+	$(SED) -e 's#@''LOCALSTATEDIR@#${localstatedir}#g' $< > $@
 
-corosync_cmapctl_LDADD	= $(LIBQB_LIBS) $(top_builddir)/lib/libcmap.la
+corosync_cmapctl_LDADD	= $(LIBQB_LIBS) $(top_builddir)/common_lib/libcorosync_common.la $(top_builddir)/lib/libcmap.la
 
-corosync_cfgtool_LDADD	= $(LIBQB_LIBS) $(top_builddir)/lib/libcfg.la
+corosync_cfgtool_LDADD	= $(LIBQB_LIBS) $(top_builddir)/common_lib/libcorosync_common.la \
+			  $(top_builddir)/lib/libcfg.la $(top_builddir)/lib/libcmap.la
 
 corosync_cpgtool_LDADD	= $(LIBQB_LIBS) $(top_builddir)/lib/libcfg.la \
-			  $(top_builddir)/lib/libcpg.la
+			  $(top_builddir)/lib/libcpg.la \
+			  $(top_builddir)/common_lib/libcorosync_common.la
 
 corosync_quorumtool_LDADD = $(LIBQB_LIBS) \
 			    $(top_builddir)/lib/libcmap.la \
 			    $(top_builddir)/lib/libcfg.la \
 			    $(top_builddir)/lib/libquorum.la \
-			    $(top_builddir)/lib/libvotequorum.la
+			    $(top_builddir)/lib/libvotequorum.la \
+			    $(top_builddir)/common_lib/libcorosync_common.la
 
-corosync_notifyd_CFLAGS   = $(DBUS_CFLAGS)
+corosync_notifyd_CFLAGS   = $(DBUS_CFLAGS) $(libsystemd_CFLAGS)
 corosync_notifyd_LDADD    = $(LIBQB_LIBS) $(DBUS_LIBS) $(SNMP_LIBS) \
+			    $(libsystemd_LIBS) \
 			    $(top_builddir)/lib/libcmap.la \
 			    $(top_builddir)/lib/libcfg.la \
-			    $(top_builddir)/lib/libquorum.la
+			    $(top_builddir)/lib/libquorum.la \
+			    $(top_builddir)/common_lib/libcorosync_common.la
 
 lint:
 	-splint $(LINT_FLAGS) $(DBUS_CFLAGS) $(CPPFLAGS) $(CFLAGS) *.c

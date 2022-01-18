@@ -1,7 +1,7 @@
 /*
  * Copyright (c) 2002-2004 MontaVista Software, Inc.
  * Copyright (c) 2004 Open Source Development Lab
- * Copyright (c) 2006-2011 Red Hat, Inc.
+ * Copyright (c) 2006-2017 Red Hat, Inc.
  *
  * All rights reserved.
  *
@@ -54,14 +54,16 @@ enum e_corosync_done {
 	COROSYNC_DONE_INIT_SERVICES = 13,
 	COROSYNC_DONE_FATAL_ERR = 15,
 	COROSYNC_DONE_DIR_NOT_PRESENT = 16,
-	COROSYNC_DONE_AQUIRE_LOCK = 17,
+	COROSYNC_DONE_ACQUIRE_LOCK = 17,
 	COROSYNC_DONE_ALREADY_RUNNING = 18,
 	COROSYNC_DONE_STD_TO_NULL_REDIR = 19,
 	COROSYNC_DONE_SERVICE_ENGINE_INIT = 20,
 	COROSYNC_DONE_STORE_RINGID = 21,
+	COROSYNC_DONE_STATS = 22,
 	COROSYNC_DONE_PLOAD = 99
 };
 
+#define min(a,b) ((a) < (b) ? (a) : (b))
 
 /**
  * Compare two names.  returns non-zero on match.
@@ -81,8 +83,16 @@ const char * short_service_name_get(uint32_t service_id,
 				    char *buf, size_t buf_size);
 
 /*
- * Return run directory (ether COROSYNC_RUN_DIR env or LOCALSTATEDIR/lib/corosync)
+ * Return state directory (ether icmap system.state_dir or LOCALSTATEDIR/lib/corosync)
  */
-const char *get_run_dir(void);
+const char *get_state_dir(void);
+
+extern int util_is_valid_knet_crypto_model(const char *val,
+	const char **list_str, int machine_parseable_str,
+	const char *error_string_prefix, const char **error_string);
+
+extern int util_is_valid_knet_compress_model(const char *val,
+	const char **list_str, int machine_parseable_str,
+	const char *error_string_prefix, const char **error_string);
 
 #endif /* UTIL_H_DEFINED */

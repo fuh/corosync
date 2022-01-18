@@ -35,7 +35,9 @@
 #ifndef TOTEM_H_DEFINED
 #define TOTEM_H_DEFINED
 #include "totemip.h"
+#include <libknet.h>
 #include <corosync/hdb.h>
+#include <corosync/totem/totemstats.h>
 
 #ifdef HAVE_SMALL_MEMORY_FOOTPRINT
 #define PROCESSOR_COUNT_MAX	16
@@ -47,10 +49,26 @@
 #define MESSAGE_QUEUE_MAX	((4 * MESSAGE_SIZE_MAX) / totem_config->net_mtu)
 #endif /* HAVE_SMALL_MEMORY_FOOTPRINT */
 
-#define FRAME_SIZE_MAX		10000
+#define FRAME_SIZE_MAX		KNET_MAX_PACKET_SIZE
+
+#define CONFIG_STRING_LEN_MAX   128
+/*
+ * Estimation of required buffer size for totemudp and totemudpu - it should be at least
+ *   sizeof(memb_join) + PROCESSOR_MAX * 2 * sizeof(srp_addr))
+ * if we want to support PROCESSOR_MAX nodes, but because we don't have
+ * srp_addr and memb_join, we have to use estimation.
+ * TODO: Consider moving srp_addr/memb_join into totem headers instead of totemsrp.c
+ */
+#define UDP_RECEIVE_FRAME_SIZE_MAX     (PROCESSOR_COUNT_MAX * (INTERFACE_MAX * 2 * sizeof(struct totem_ip_address)) + 1024)
+
 #define TRANSMITS_ALLOWED	16
 #define SEND_THREADS_MAX	16
-#define INTERFACE_MAX		2
+
+/* This must be <= KNET_MAX_LINK */
+#define INTERFACE_MAX		8
+
+#define BIND_MAX_RETRIES	10
+#define BIND_RETRIES_INTERVAL	100
 
 /**
  * Maximum number of continuous gather states
@@ -65,9 +83,17 @@ struct totem_interface {
 	struct totem_ip_address bindnet;
 	struct totem_ip_address boundto;
 	struct totem_ip_address mcast_addr;
+	struct totem_ip_address local_ip;
 	uint16_t ip_port;
 	uint16_t ttl;
+	uint8_t  configured;
 	int member_count;
+	int knet_link_priority;
+	int knet_ping_interval;
+	int knet_ping_timeout;
+	int knet_ping_precision;
+	int knet_pong_count;
+	int knet_transport;
 	struct totem_ip_address member_list[PROCESSOR_COUNT_MAX];
 };
 
@@ -90,20 +116,45 @@ struct totem_logging_configuration {
 	int log_subsys_id;
 };
 
-enum { TOTEM_PRIVATE_KEY_LEN = 128 };
-enum { TOTEM_RRP_MODE_BYTES = 64 };
+
+/*
+ * COrosync TOtem. Also used as an endian_detector.
+ */
+#define TOTEM_MH_MAGIC		0xC070
+#define TOTEM_MH_VERSION	0x03
+
+struct totem_message_header {
+	unsigned short magic;
+	char version;
+	char type;
+	char encapsulated;
+	unsigned int nodeid;
+	unsigned int target_nodeid;
+} __attribute__((packed));
+
+enum {
+	TOTEM_PRIVATE_KEY_LEN_MIN = KNET_MIN_KEY_LEN,
+	TOTEM_PRIVATE_KEY_LEN_MAX = KNET_MAX_KEY_LEN
+};
+
+enum { TOTEM_LINK_MODE_BYTES = 64 };
 
 typedef enum {
 	TOTEM_TRANSPORT_UDP = 0,
 	TOTEM_TRANSPORT_UDPU = 1,
-	TOTEM_TRANSPORT_RDMA = 2
+	TOTEM_TRANSPORT_KNET = 2
 } totem_transport_t;
 
 #define MEMB_RING_ID
 struct memb_ring_id {
-	struct totem_ip_address rep;
+	unsigned int rep;
 	unsigned long long seq;
 } __attribute__((packed));
+
+typedef enum {
+	CRYPTO_RECONFIG_PHASE_ACTIVATE = 1,
+	CRYPTO_RECONFIG_PHASE_CLEANUP = 2,
+} cfg_message_crypto_reconfig_phase_t;
 
 struct totem_config {
 	int version;
@@ -112,14 +163,15 @@ struct totem_config {
 	 * network
 	 */
 	struct totem_interface *interfaces;
-	unsigned int interface_count;
+	struct totem_interface *orig_interfaces; /* for reload */
 	unsigned int node_id;
 	unsigned int clear_node_high_bit;
+	unsigned int knet_pmtud_interval;
 
 	/*
 	 * key information
 	 */
-	unsigned char private_key[TOTEM_PRIVATE_KEY_LEN];
+	unsigned char private_key[TOTEM_PRIVATE_KEY_LEN_MAX];
 
 	unsigned int private_key_len;
 
@@ -127,6 +179,8 @@ struct totem_config {
 	 * Totem configuration parameters
 	 */
 	unsigned int token_timeout;
+
+	unsigned int token_warning;
 
 	unsigned int token_retransmit_timeout;
 
@@ -148,17 +202,7 @@ struct totem_config {
 
 	unsigned int seqno_unchanged_const;
 
-	unsigned int rrp_token_expired_timeout;
-
-	unsigned int rrp_problem_count_timeout;
-
-	unsigned int rrp_problem_count_threshold;
-
-	unsigned int rrp_problem_count_mcast_threshold;
-
-	unsigned int rrp_autorecovery_check_timeout;
-
-	char rrp_mode[TOTEM_RRP_MODE_BYTES];
+	char link_mode[TOTEM_LINK_MODE_BYTES];
 
 	struct totem_logging_configuration totem_logging_configuration;
 
@@ -174,28 +218,61 @@ struct totem_config {
 
 	unsigned int max_messages;
 
-	const char *vsf_type;
-
 	unsigned int broadcast_use;
 
-	char *crypto_cipher_type;
+	char crypto_model[CONFIG_STRING_LEN_MAX];
 
-	char *crypto_hash_type;
+	char crypto_cipher_type[CONFIG_STRING_LEN_MAX];
+
+	char crypto_hash_type[CONFIG_STRING_LEN_MAX];
+
+	int crypto_index; /* Num of crypto config currently loaded into knet ( 1 or 2 ) */
+
+	int crypto_changed; /* Has crypto changed since last time? (it's expensive to reload) */
+
+	char knet_compression_model[CONFIG_STRING_LEN_MAX];
+
+	uint32_t knet_compression_threshold;
+
+	int knet_compression_level;
 
 	totem_transport_t transport_number;
 
 	unsigned int miss_count_const;
 
-	int ip_version;
+	enum totem_ip_version_enum ip_version;
+
+	unsigned int block_unlisted_ips;
+
+	unsigned int cancel_token_hold_on_retransmit;
 
 	void (*totem_memb_ring_id_create_or_load) (
 	    struct memb_ring_id *memb_ring_id,
-	    const struct totem_ip_address *addr);
+	    unsigned int nodeid);
 
 	void (*totem_memb_ring_id_store) (
 	    const struct memb_ring_id *memb_ring_id,
-	    const struct totem_ip_address *addr);
+	    unsigned int nodeid);
 };
+
+/*
+ * Node status returned from the API
+ * Usually the same as the cfg version (except for
+ * link_status)
+ */
+#define TOTEM_NODE_STATUS_STRUCTURE_VERSION 1
+struct totem_node_status {
+	uint32_t version; /* Structure version */
+	unsigned int nodeid;
+	uint8_t reachable;
+	uint8_t remote;
+	uint8_t external;
+	uint8_t onwire_min;
+	uint8_t onwire_max;
+	uint8_t onwire_ver;
+	struct knet_link_status link_status[KNET_MAX_LINK];
+};
+
 
 #define TOTEM_CONFIGURATION_TYPE
 enum totem_configuration_type {
@@ -213,81 +290,5 @@ enum totem_event_type {
 	TOTEM_EVENT_DELIVERY_CONGESTED,
 	TOTEM_EVENT_NEW_MSG,
 };
-
-typedef struct {
-	int is_dirty;
-	time_t last_updated;
-} totem_stats_header_t;
-
-typedef struct {
-	totem_stats_header_t hdr;
-	uint32_t iface_changes;
-} totemnet_stats_t;
-
-typedef struct {
-	totem_stats_header_t hdr;
-	totemnet_stats_t *net;
-	char *algo_name;
-	uint8_t *faulty;
-	uint32_t interface_count;
-} totemrrp_stats_t;
-
-
-typedef struct {
-	uint32_t rx;
-	uint32_t tx;
-	int backlog_calc;
-} totemsrp_token_stats_t;
-
-typedef struct {
-	totem_stats_header_t hdr;
-	totemrrp_stats_t *rrp;
-	uint64_t orf_token_tx;
-	uint64_t orf_token_rx;
-	uint64_t memb_merge_detect_tx;
-	uint64_t memb_merge_detect_rx;
-	uint64_t memb_join_tx;
-	uint64_t memb_join_rx;
-	uint64_t mcast_tx;
-	uint64_t mcast_retx;
-	uint64_t mcast_rx;
-	uint64_t memb_commit_token_tx;
-	uint64_t memb_commit_token_rx;
-	uint64_t token_hold_cancel_tx;
-	uint64_t token_hold_cancel_rx;
-	uint64_t operational_entered;
-	uint64_t operational_token_lost;
-	uint64_t gather_entered;
-	uint64_t gather_token_lost;
-	uint64_t commit_entered;
-	uint64_t commit_token_lost;
-	uint64_t recovery_entered;
-	uint64_t recovery_token_lost;
-	uint64_t consensus_timeouts;
-	uint64_t rx_msg_dropped;
-	uint32_t continuous_gather;
-	uint32_t continuous_sendmsg_failures;
-
-	int earliest_token;
-	int latest_token;
-#define TOTEM_TOKEN_STATS_MAX 100
-	totemsrp_token_stats_t token[TOTEM_TOKEN_STATS_MAX];
-
-} totemsrp_stats_t;
-
- 
- #define TOTEM_CONFIGURATION_TYPE
-
-typedef struct {
-	totem_stats_header_t hdr;
-	totemsrp_stats_t *srp;
-} totemmrp_stats_t;
-
-typedef struct {
-	totem_stats_header_t hdr;
-	totemmrp_stats_t *mrp;
-	uint32_t msg_reserved;
-	uint32_t msg_queue_avail;
-} totempg_stats_t;
 
 #endif /* TOTEM_H_DEFINED */

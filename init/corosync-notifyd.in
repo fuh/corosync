@@ -11,8 +11,8 @@
 #
 ### BEGIN INIT INFO
 # Provides:		corosync-notifyd
-# Required-Start:	$corosync $cman
-# Required-Stop:	$corosync $cman
+# Required-Start:	corosync cman
+# Required-Stop:	corosync cman
 # Default-Start:
 # Default-Stop:
 # Short-Description:	Starts and stops Corosync Notifier.
@@ -47,18 +47,15 @@ status()
 	return $rtrn
 }
 
-# rpm based distros
-if [ -d @SYSCONFDIR@/sysconfig ]; then
-	[ -f @INITDDIR@/functions ] && . @INITDDIR@/functions
-	[ -f @SYSCONFDIR@/sysconfig/$prog ] && . @SYSCONFDIR@/sysconfig/$prog
-	[ -z "$LOCK_FILE" ] && LOCK_FILE="@LOCALSTATEDIR@/lock/subsys/$prog"
-fi
+[ -f @INITCONFIGDIR@/$prog ] && . @INITCONFIGDIR@/$prog
 
-# deb based distros
-if [ -d @SYSCONFDIR@/default ]; then
-	[ -f @SYSCONFDIR@/default/$prog ] && . @SYSCONFDIR@/default/$prog
-	[ -z "$LOCK_FILE" ] && LOCK_FILE="@LOCALSTATEDIR@/lock/$prog"
-fi
+case '@INITCONFIGDIR@' in
+    */sysconfig) # rpm based distros
+	[ -f @INITDDIR@/functions ] && . @INITDDIR@/functions
+	[ -z "$LOCK_FILE" ] && LOCK_FILE="@LOCALSTATEDIR@/lock/subsys/$prog";;
+    */default) # deb based distros
+	[ -z "$LOCK_FILE" ] && LOCK_FILE="@LOCALSTATEDIR@/lock/$prog";;
+esac
 
 # The version of __pids_pidof in /etc/init.d/functions calls pidof with -x
 # This means it matches scripts, including this one.
@@ -102,7 +99,7 @@ stop()
 	! status $prog > /dev/null 2>&1 && return
 
 	echo -n "Signaling $desc ($prog) to terminate: "
-	kill -TERM $(pidof $prog) > /dev/null 2>&1
+	kill -TERM "$(pidof $prog)" > /dev/null 2>&1
 	success
 	echo
 

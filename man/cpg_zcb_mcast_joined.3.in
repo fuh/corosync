@@ -31,7 +31,7 @@
 .\" * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
 .\" * THE POSSIBILITY OF SUCH DAMAGE.
 .\" */
-.TH CPG_ZCB_MCAST_JOINED 3 3004-08-31 "corosync Man Page" "Corosync Cluster Engine Programmer's Manual"
+.TH CPG_ZCB_MCAST_JOINED 3 2004-08-31 "corosync Man Page" "Corosync Cluster Engine Programmer's Manual"
 .SH NAME
 cpg_mcast_joined \- Multicasts a zero copy buffer to all groups joined to a handle
 .SH SYNOPSIS
@@ -45,7 +45,7 @@ The
 function will multicast a zero copy buffer message to all the processes that
 have been joined with the
 .B cpg_join(3)
-funtion for the same group name.
+function for the same group name.
 Messages that are sent to any of the groups joined to the parameter
 .I handle
 will be delivered to all subscribed processes in the system.
@@ -108,7 +108,7 @@ This call returns the CS_OK value if successful, otherwise an error is returned.
 .SH ERRORS
 The errors are undocumented.
 .SH "SEE ALSO"
-.BR cpg_overview (8),
+.BR cpg_overview (3),
 .BR cpg_initialize (3),
 .BR cpg_finalize (3),
 .BR cpg_fd_get (3),

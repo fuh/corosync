@@ -42,7 +42,7 @@ votequorum_context_set \- Sets the context variable for a VOTEQUORUM instance
 The
 .B votequorum_context_set
 function is used to set the context variable for a votequorum instance. It has no
-meaning insire libvotequorum itself and will not be touched by the library. It can
+meaning inside libvotequorum itself and will not be touched by the library. It can
 be retrieved using
 .B votequorum_context_get(3)
 .SH RETURN VALUE
@@ -51,7 +51,7 @@ This call returns the CS_OK value if successful, otherwise an error is returned.
 .SH ERRORS
 @COMMONIPCERRORS@
 .SH "SEE ALSO"
-.BR votequorum_overview (8),
+.BR votequorum_overview (3),
 .BR votequorum_initialize (3),
 .BR votequorum_finalize (3),
 .BR votequorum_getinfo (3),

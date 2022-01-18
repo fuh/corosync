@@ -31,10 +31,11 @@
 .\" * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
 .\" * THE POSSIBILITY OF SUCH DAMAGE.
 .\" */
-.TH CPG_MCAST_JOINED 3 3004-08-31 "corosync Man Page" "Corosync Cluster Engine Programmer's Manual"
+.TH CPG_MCAST_JOINED 3 2004-08-31 "corosync Man Page" "Corosync Cluster Engine Programmer's Manual"
 .SH NAME
 cpg_mcast_joined \- Multicasts to all groups joined to a handle
 .SH SYNOPSIS
+.nf
 .B #include <sys/uio.h>
 .B #include <corosync/cpg.h>
 .sp
@@ -112,7 +113,7 @@ struct iovec
 .PP
 The
 .I iov_len
-argument describes the number of entires in the
+argument describes the number of entries in the
 .I iovec
 argument.
 
@@ -122,7 +123,7 @@ This call returns the CS_OK value if successful, otherwise an error is returned.
 .SH ERRORS
 The errors are undocumented.
 .SH "SEE ALSO"
-.BR cpg_overview (8),
+.BR cpg_overview (3),
 .BR cpg_initialize (3),
 .BR cpg_finalize (3),
 .BR cpg_fd_get (3),

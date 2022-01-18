@@ -53,10 +53,10 @@ enum user_action {
 	ACTION_SET,
 	ACTION_DELETE,
 	ACTION_DELETE_PREFIX,
-	ACTION_PRINT_ALL,
 	ACTION_PRINT_PREFIX,
 	ACTION_TRACK,
 	ACTION_LOAD,
+	ACTION_CLEARSTATS,
 };
 
 struct name_to_type_item {
@@ -79,6 +79,7 @@ struct name_to_type_item name_to_type[] = {
 	{"bin", CMAP_VALUETYPE_BINARY}};
 
 int show_binary = 0;
+int quiet = 0;
 
 static int convert_name_to_type(const char *name)
 {
@@ -96,15 +97,26 @@ static int convert_name_to_type(const char *name)
 static int print_help(void)
 {
 	printf("\n");
-	printf("usage:  corosync-cmapctl [-b] [-dghsTtp] [params...]\n");
+	printf("usage:  corosync-cmapctl [-b] [-DdghsqTCt] [-p filename] [-m map] [params...]\n");
 	printf("\n");
 	printf("    -b show binary values\n");
 	printf("\n");
+	printf("    -m select map to use\n");
+	printf("          The  default  map is 'icmap' which contains configuration information and some runtime variables used by corosync. \n");
+	printf("          A 'stats' map is also available which displays network statistics - in great detail when knet is used as the transport.\n");
 	printf("Set key:\n");
 	printf("    corosync-cmapctl -s key_name type value\n");
 	printf("\n");
 	printf("    where type is one of ([i|u][8|16|32|64] | flt | dbl | str | bin)\n");
 	printf("    for bin, value is file name (or - for stdin)\n");
+	printf("\n");
+	printf("    map can be either 'icmap' (the default) which contains corosync\n");
+	printf("    configuration information, or 'stats' which contains statistics\n");
+	printf("    about the networking and IPC traffic in some detail.\n");
+	printf("\n");
+	printf("Clear stats:\n");
+	printf("    corosync-cmapctl -C [knet|ipc|totem|schedmiss|all]\n");
+	printf("    The 'stats' map is implied\n");
 	printf("\n");
 	printf("Load settings from a file:\n");
 	printf("    corosync-cmapctl -p filename\n");
@@ -124,6 +136,9 @@ static int print_help(void)
 	printf("\n");
 	printf("Get key:\n");
 	printf("    corosync-cmapctl [-b] -g key_name...\n");
+	printf("\n");
+	printf("Quiet mode:\n");
+	printf("    corosync-cmapctl [-b] -q -g key_name...\n");
 	printf("\n");
 	printf("Display all keys:\n");
 	printf("    corosync-cmapctl [-b]\n");
@@ -284,15 +299,16 @@ static void print_key(cmap_handle_t handle,
 			break;
 		}
 
-		if (err == CS_OK)
+		if (err == CS_OK) {
 			end_loop = 1;
-
-		if (err == CS_ERR_TRY_AGAIN) {
+		} else if (err == CS_ERR_TRY_AGAIN) {
 			sleep(1);
 			no_retries++;
-		}
 
-		if (no_retries > MAX_TRY_AGAIN) {
+			if (no_retries > MAX_TRY_AGAIN) {
+				end_loop = 1;
+			}
+		} else {
 			end_loop = 1;
 		}
 	};
@@ -300,44 +316,84 @@ static void print_key(cmap_handle_t handle,
 	if (err != CS_OK) {
 		fprintf(stderr, "Can't get value of %s. Error %s\n", key_name, cs_strerror(err));
 
+		/*
+		 * bin_value was newly allocated
+		 */
+		if (bin_value != NULL && value == NULL) {
+			free(bin_value);
+		}
 		return ;
 	}
 
-	printf("%s (", key_name);
+	if (!quiet)
+		printf("%s (", key_name);
 
 	switch (type) {
 	case CMAP_VALUETYPE_INT8:
-		printf("%s) = %"PRId8, "i8", i8);
+		if (!quiet)
+			printf("%s) = %"PRId8, "i8", i8);
+		else
+			printf("%"PRId8, i8);
 		break;
 	case CMAP_VALUETYPE_UINT8:
-		printf("%s) = %"PRIu8, "u8", u8);
+		if (!quiet)
+			printf("%s) = %"PRIu8, "u8", u8);
+                else
+			printf("%"PRIu8, u8);
 		break;
 	case CMAP_VALUETYPE_INT16:
-		printf("%s) = %"PRId16, "i16", i16);
+		if (!quiet)
+			printf("%s) = %"PRId16, "i16", i16);
+		else
+			printf("%"PRId16, i16);
 		break;
 	case CMAP_VALUETYPE_UINT16:
-		printf("%s) = %"PRIu16, "u16", u16);
+		if (!quiet)
+			printf("%s) = %"PRIu16, "u16", u16);
+		else
+			printf("%"PRIu16, u16);
 		break;
 	case CMAP_VALUETYPE_INT32:
-		printf("%s) = %"PRId32, "i32", i32);
+		if (!quiet)
+			printf("%s) = %"PRId32, "i32", i32);
+		else
+			printf("%"PRId32, i32);
 		break;
 	case CMAP_VALUETYPE_UINT32:
-		printf("%s) = %"PRIu32, "u32", u32);
+		if (!quiet)
+			printf("%s) = %"PRIu32, "u32", u32);
+		else
+			printf("%"PRIu32, u32);
 		break;
 	case CMAP_VALUETYPE_INT64:
-		printf("%s) = %"PRId64, "i64", i64);
+		if (!quiet)
+			printf("%s) = %"PRId64, "i64", i64);
+		else
+			printf("%"PRId64, i64);
 		break;
 	case CMAP_VALUETYPE_UINT64:
-		printf("%s) = %"PRIu64, "u64", u64);
+		if (!quiet)
+			printf("%s) = %"PRIu64, "u64", u64);
+		else
+			printf("%"PRIu64, u64);
 		break;
 	case CMAP_VALUETYPE_FLOAT:
-		printf("%s) = %f", "flt", flt);
+		if (!quiet)
+			printf("%s) = %f", "flt", flt);
+		else
+			printf("%f", flt);
 		break;
 	case CMAP_VALUETYPE_DOUBLE:
-		printf("%s) = %lf", "dbl", dbl);
+		if (!quiet)
+			printf("%s) = %lf", "dbl", dbl);
+		else
+			printf("%lf", dbl);
 		break;
 	case CMAP_VALUETYPE_STRING:
-		printf("%s) = %s", "str", str);
+		if (!quiet)
+			printf("%s) = %s", "str", str);
+		else
+			printf("%s", str);
 		if (value == NULL) {
 			free(str);
 		}
@@ -361,13 +417,14 @@ static void print_key(cmap_handle_t handle,
 	printf("\n");
 }
 
-static void print_iter(cmap_handle_t handle, const char *prefix)
+static int print_iter(cmap_handle_t handle, const char *prefix)
 {
 	cmap_iter_handle_t iter_handle;
 	char key_name[CMAP_KEYNAME_MAXLEN + 1];
 	size_t value_len;
 	cmap_value_types_t type;
 	cs_error_t err;
+	int no_result = 1;
 
 	err = cmap_iter_init(handle, prefix, &iter_handle);
 	if (err != CS_OK) {
@@ -376,9 +433,12 @@ static void print_iter(cmap_handle_t handle, const char *prefix)
 	}
 
 	while ((err = cmap_iter_next(handle, iter_handle, key_name, &value_len, &type)) == CS_OK) {
+		no_result = 0;
 		print_key(handle, key_name, value_len, NULL, type);
 	}
+
 	cmap_iter_finalize(handle, iter_handle);
+	return no_result;
 }
 
 static void delete_with_prefix(cmap_handle_t handle, const char *prefix)
@@ -728,11 +788,23 @@ static void read_in_config_file(cmap_handle_t handle, char * filename)
 		} else {
 			key_type_s = strtok(NULL, " \n");
 			key_value_s = strtok(NULL, " \n");
+			if (key_type_s == NULL || key_value_s == NULL) {
+				fprintf(stderr, "Both type and value for key %s are required\n", key_name);
+				exit (EXIT_FAILURE);
+			}
 			set_key(handle, key_name, key_type_s, key_value_s);
 		}
 	}
 
 	fclose (fh);
+}
+
+static void clear_stats(cmap_handle_t handle, char *clear_opt)
+{
+	char key_name[CMAP_KEYNAME_MAXLEN + 1];
+
+	sprintf(key_name, "stats.clear.%s", clear_opt);
+	cmap_set_uint32(handle, key_name, 1);
 }
 
 int main(int argc, char *argv[])
@@ -744,20 +816,27 @@ int main(int argc, char *argv[])
 	int i;
 	size_t value_len;
 	cmap_value_types_t type;
+	cmap_map_t map = CMAP_MAP_DEFAULT;
 	int track_prefix;
+	int map_set = 0;
 	int no_retries;
+	char * clear_opt = NULL;
 	char * settings_file = NULL;
+	int count_of_no_result = 0;
 
 	action = ACTION_PRINT_PREFIX;
 	track_prefix = 1;
 
-	while ((c = getopt(argc, argv, "hgsdDtTbp:")) != -1) {
+	while ((c = getopt(argc, argv, "m:hqgsdDtTbp:C:")) != -1) {
 		switch (c) {
 		case 'h':
 			return print_help();
 			break;
 		case 'b':
 			show_binary++;
+			break;
+		case 'q':
+			quiet = 1;
 			break;
 		case 'g':
 			action = ACTION_GET;
@@ -775,12 +854,44 @@ int main(int argc, char *argv[])
 			settings_file = optarg;
 			action = ACTION_LOAD;
 			break;
+		case 'C':
+			if (strcmp(optarg, "knet") == 0 ||
+			    strcmp(optarg, "totem") == 0 ||
+			    strcmp(optarg, "ipc") == 0 ||
+			    strcmp(optarg, "schedmiss") == 0 ||
+			    strcmp(optarg, "all") == 0) {
+				action = ACTION_CLEARSTATS;
+				clear_opt = optarg;
+
+				/* Force the map to be STATS */
+				map = CMAP_MAP_STATS;
+			}
+			else {
+				fprintf(stderr, "argument to -C should be 'knet', 'totem', 'ipc', 'schedmiss' or 'all'\n");
+				return (EXIT_FAILURE);
+			}
+			break;
 		case 't':
 			action = ACTION_TRACK;
 			track_prefix = 0;
 			break;
 		case 'T':
 			action = ACTION_TRACK;
+			break;
+		case 'm':
+			if (strcmp(optarg, "icmap") == 0 ||
+			    strcmp(optarg, "default") == 0) {
+				map = CMAP_MAP_ICMAP;
+				map_set = 1;
+			}
+			if (strcmp(optarg, "stats") == 0) {
+				map = CMAP_MAP_STATS;
+				map_set = 1;
+			}
+			if (!map_set) {
+				fprintf(stderr, "invalid map name, must be 'default', 'icmap' or 'stats'\n");
+				return (EXIT_FAILURE);
+			}
 			break;
 		case '?':
 			return (EXIT_FAILURE);
@@ -791,22 +902,20 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	if (argc == 1 || (argc == 2 && show_binary)) {
-		action = ACTION_PRINT_ALL;
-	}
-
 	argc -= optind;
 	argv += optind;
 
 	if (argc == 0 &&
 	    action != ACTION_LOAD &&
-	    action != ACTION_PRINT_ALL) {
+	    action != ACTION_CLEARSTATS &&
+	    action != ACTION_PRINT_PREFIX) {
 		fprintf(stderr, "Expected key after options\n");
 		return (EXIT_FAILURE);
 	}
 
 	no_retries = 0;
-	while ((err = cmap_initialize(&handle)) == CS_ERR_TRY_AGAIN && no_retries++ < MAX_TRY_AGAIN) {
+
+	while ((err = cmap_initialize_map(&handle, map)) == CS_ERR_TRY_AGAIN && no_retries++ < MAX_TRY_AGAIN) {
 		sleep(1);
 	}
 
@@ -816,12 +925,17 @@ int main(int argc, char *argv[])
 	}
 
 	switch (action) {
-	case ACTION_PRINT_ALL:
-		print_iter(handle, NULL);
-		break;
 	case ACTION_PRINT_PREFIX:
-		for (i = 0; i < argc; i++) {
-			print_iter(handle, argv[i]);
+		if (argc == 0) {
+			count_of_no_result = print_iter(handle, NULL);
+		} else {
+			for (i = 0; i < argc; i++) {
+				count_of_no_result += print_iter(handle, argv[i]);
+			}
+		}
+
+		if (count_of_no_result > 0 && count_of_no_result >= argc) {
+			return (EXIT_FAILURE);
 		}
 		break;
 	case ACTION_GET:
@@ -831,6 +945,7 @@ int main(int argc, char *argv[])
 				print_key(handle, argv[i], value_len, NULL, type);
 			} else {
 				fprintf(stderr, "Can't get key %s. Error %s\n", argv[i], cs_strerror(err));
+				return (EXIT_FAILURE);
 			}
 		}
 		break;
@@ -839,6 +954,7 @@ int main(int argc, char *argv[])
 			err = cmap_delete(handle, argv[i]);
 			if (err != CS_OK) {
 				fprintf(stderr, "Can't delete key %s. Error %s\n", argv[i], cs_strerror(err));
+				return (EXIT_FAILURE);
 			}
 		}
 		break;
@@ -863,6 +979,9 @@ int main(int argc, char *argv[])
 		}
 
 		set_key(handle, argv[0], argv[1], argv[2]);
+		break;
+	case ACTION_CLEARSTATS:
+		clear_stats(handle, clear_opt);
 		break;
 
 	}

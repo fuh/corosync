@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011 Red Hat, Inc.
+ * Copyright (c) 2011-2017 Red Hat, Inc.
  *
  * All rights reserved.
  *
@@ -39,6 +39,9 @@
 #include <corosync/corotypes.h>
 #include <corosync/mar_gen.h>
 
+/**
+ * @brief The req_cmap_types enum
+ */
 enum req_cmap_types {
 	MESSAGE_REQ_CMAP_SET = 0,
 	MESSAGE_REQ_CMAP_DELETE = 1,
@@ -49,8 +52,12 @@ enum req_cmap_types {
 	MESSAGE_REQ_CMAP_ITER_FINALIZE = 6,
 	MESSAGE_REQ_CMAP_TRACK_ADD = 7,
 	MESSAGE_REQ_CMAP_TRACK_DELETE = 8,
+	MESSAGE_REQ_CMAP_SET_CURRENT_MAP = 9,
 };
 
+/**
+ * @brief The res_cmap_types enum
+ */
 enum res_cmap_types {
 	MESSAGE_RES_CMAP_SET = 0,
 	MESSAGE_RES_CMAP_DELETE = 1,
@@ -62,8 +69,17 @@ enum res_cmap_types {
 	MESSAGE_RES_CMAP_TRACK_ADD = 7,
 	MESSAGE_RES_CMAP_TRACK_DELETE = 8,
 	MESSAGE_RES_CMAP_NOTIFY_CALLBACK = 9,
+	MESSAGE_RES_CMAP_SET_CURRENT_MAP = 10,
 };
 
+enum {
+	CMAP_SETMAP_DEFAULT        = 0,
+	CMAP_SETMAP_STATS          = 1,
+};
+
+/**
+ * @brief The req_lib_cmap_set struct
+ */
 struct req_lib_cmap_set {
 	struct qb_ipc_request_header header __attribute__((aligned(8)));
 	mar_name_t key_name __attribute__((aligned(8)));
@@ -72,25 +88,40 @@ struct req_lib_cmap_set {
 	mar_uint8_t value[] __attribute__((aligned(8)));
 };
 
+/**
+ * @brief The res_lib_cmap_set struct
+ */
 struct res_lib_cmap_set {
 	struct qb_ipc_response_header header __attribute__((aligned(8)));
 };
 
+/**
+ * @brief The req_lib_cmap_delete struct
+ */
 struct req_lib_cmap_delete {
 	struct qb_ipc_request_header header __attribute__((aligned(8)));
 	mar_name_t key_name __attribute__((aligned(8)));
 };
 
+/**
+ * @brief The res_lib_cmap_delete struct
+ */
 struct res_lib_cmap_delete {
 	struct qb_ipc_response_header header __attribute__((aligned(8)));
 };
 
+/**
+ * @brief The req_lib_cmap_get struct
+ */
 struct req_lib_cmap_get {
 	struct qb_ipc_request_header header __attribute__((aligned(8)));
 	mar_name_t key_name __attribute__((aligned(8)));
 	mar_size_t value_len __attribute__((aligned(8)));
 };
 
+/**
+ * @brief The res_lib_cmap_get struct
+ */
 struct res_lib_cmap_get {
 	struct qb_ipc_response_header header __attribute__((aligned(8)));
 	mar_size_t value_len __attribute__((aligned(8)));
@@ -98,31 +129,49 @@ struct res_lib_cmap_get {
 	mar_uint8_t value[] __attribute__((aligned(8)));
 };
 
+/**
+ * @brief The req_lib_cmap_adjust_int struct
+ */
 struct req_lib_cmap_adjust_int {
 	struct qb_ipc_request_header header __attribute__((aligned(8)));
 	mar_name_t key_name __attribute__((aligned(8)));
 	mar_int32_t step __attribute__((aligned(8)));
 };
 
+/**
+ * @brief The res_lib_cmap_adjust_int struct
+ */
 struct res_lib_cmap_adjust_int {
 	struct qb_ipc_response_header header __attribute__((aligned(8)));
 };
 
+/**
+ * @brief The req_lib_cmap_iter_init struct
+ */
 struct req_lib_cmap_iter_init {
 	struct qb_ipc_request_header header __attribute__((aligned(8)));
 	mar_name_t prefix __attribute__((aligned(8)));
 };
 
+/**
+ * @brief The res_lib_cmap_iter_init struct
+ */
 struct res_lib_cmap_iter_init {
 	struct qb_ipc_response_header header __attribute__((aligned(8)));
 	mar_uint64_t iter_handle __attribute__((aligned(8)));
 };
 
+/**
+ * @brief The req_lib_cmap_iter_next struct
+ */
 struct req_lib_cmap_iter_next {
 	struct qb_ipc_request_header header __attribute__((aligned(8)));
 	mar_uint64_t iter_handle __attribute__((aligned(8)));
 };
 
+/**
+ * @brief The res_lib_cmap_iter_next struct
+ */
 struct res_lib_cmap_iter_next {
 	struct qb_ipc_response_header header __attribute__((aligned(8)));
 	mar_name_t key_name __attribute__((aligned(8)));
@@ -130,15 +179,24 @@ struct res_lib_cmap_iter_next {
 	mar_uint8_t type __attribute__((aligned(8)));
 };
 
+/**
+ * @brief The req_lib_cmap_iter_finalize struct
+ */
 struct req_lib_cmap_iter_finalize {
 	struct qb_ipc_request_header header __attribute__((aligned(8)));
 	mar_uint64_t iter_handle __attribute__((aligned(8)));
 };
 
+/**
+ * @brief The res_lib_cmap_iter_finalize struct
+ */
 struct res_lib_cmap_iter_finalize {
 	struct qb_ipc_response_header header __attribute__((aligned(8)));
 };
 
+/**
+ * @brief The req_lib_cmap_track_add struct
+ */
 struct req_lib_cmap_track_add {
 	struct qb_ipc_request_header header __attribute__((aligned(8)));
 	mar_name_t key_name __attribute__((aligned(8)));
@@ -146,21 +204,33 @@ struct req_lib_cmap_track_add {
 	mar_uint64_t track_inst_handle __attribute__((aligned(8)));
 };
 
+/**
+ * @brief The res_lib_cmap_track_add struct
+ */
 struct res_lib_cmap_track_add {
 	struct qb_ipc_response_header header __attribute__((aligned(8)));
 	mar_uint64_t track_handle __attribute__((aligned(8)));
 };
 
+/**
+ * @brief The req_lib_cmap_track_delete struct
+ */
 struct req_lib_cmap_track_delete {
 	struct qb_ipc_request_header header __attribute__((aligned(8)));
 	mar_uint64_t track_handle __attribute__((aligned(8)));
 };
 
+/**
+ * @brief The res_lib_cmap_track_delete struct
+ */
 struct res_lib_cmap_track_delete {
 	struct qb_ipc_response_header header __attribute__((aligned(8)));
 	mar_uint64_t track_inst_handle __attribute__((aligned(8)));
 };
 
+/**
+ * @brief The res_lib_cmap_notify_callback struct
+ */
 struct res_lib_cmap_notify_callback {
 	struct qb_ipc_response_header header __attribute__((aligned(8)));
 	mar_uint64_t track_inst_handle __attribute__((aligned(8)));
@@ -179,5 +249,15 @@ struct res_lib_cmap_notify_callback {
 	 */
 	mar_uint8_t new_value[];
 };
+
+/**
+ * @brief The req_lib_cmap_set_current_map struct
+ * used by cmap_initialize_map()
+ */
+struct req_lib_cmap_set_current_map {
+	struct qb_ipc_request_header header __attribute__((aligned(8)));
+	mar_int32_t map __attribute__((aligned(8)));
+};
+
 
 #endif /* IPC_CMAP_H_DEFINED */

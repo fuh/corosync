@@ -47,7 +47,6 @@
 #include <qb/qbutil.h>
 #include <qb/qblog.h>
 
-#include <corosync/list.h>
 #include <corosync/logsys.h>
 
 /*
@@ -118,6 +117,8 @@ static void logsys_file_format_get(char* file_format, int buf_len);
 static char *format_buffer=NULL;
 
 static int logsys_thread_started = 0;
+
+static int logsys_blackbox_enabled = 1;
 
 static int _logsys_config_subsys_get_unlocked (const char *subsys)
 {
@@ -309,7 +310,6 @@ int _logsys_system_setup(
 	int i;
 	int32_t fidx;
 	char tempsubsys[LOGSYS_MAX_SUBSYS_NAMELEN];
-	int blackbox_enable_res;
 
 	if ((mainsystem == NULL) ||
 	    (strlen(mainsystem) >= LOGSYS_MAX_SUBSYS_NAMELEN)) {
@@ -371,9 +371,16 @@ int _logsys_system_setup(
 			  QB_LOG_FILTER_FILE, "*", LOG_TRACE);
 	qb_log_ctl(QB_LOG_BLACKBOX, QB_LOG_CONF_SIZE, IPC_LOGSYS_SIZE);
 	qb_log_ctl(QB_LOG_BLACKBOX, QB_LOG_CONF_THREADED, QB_FALSE);
-	blackbox_enable_res = qb_log_ctl(QB_LOG_BLACKBOX, QB_LOG_CONF_ENABLED, QB_TRUE);
+
+	/*
+	 * Blackbox is disabled at the init and enabled later based
+	 * on config (logging.blackbox) value.
+	 */
+	qb_log_ctl(QB_LOG_BLACKBOX, QB_LOG_CONF_ENABLED, QB_FALSE);
 
 	if (logsys_format_set(NULL) == -1) {
+		pthread_mutex_unlock (&logsys_config_mutex);
+
 		return -1;
 	}
 
@@ -395,14 +402,6 @@ int _logsys_system_setup(
 			_logsys_config_mode_set_unlocked(i, logsys_loggers[i].mode);
 			_logsys_config_apply_per_subsys(i);
 		}
-	}
-
-	if (blackbox_enable_res < 0) {
-		LOGSYS_PERROR (-blackbox_enable_res, LOGSYS_LEVEL_WARNING,
-		    "Unable to initialize log flight recorder. "\
-		    "The most common cause of this error is " \
-		    "not enough space on /dev/shm. Corosync will continue work, " \
-		    "but blackbox will not be available");
 	}
 
 	pthread_mutex_unlock (&logsys_config_mutex);
@@ -570,17 +569,25 @@ int logsys_config_file_set (
 static void
 logsys_file_format_get(char* file_format, int buf_len)
 {
-	char *per_t;
+	char *format_buffer_start;
+	char *str_pos;
+
 	file_format[0] = '\0';
-	per_t = strstr(format_buffer, "%t");
-	if (per_t) {
-		strcpy(file_format, "%t [%P] %H %N");
-		per_t += 2;
-		strncat(file_format, per_t, buf_len - strlen("%t [%P] %H %N"));
-	} else {
-		strcpy(file_format, "[%P] %H %N");
-		strncat(file_format, format_buffer, buf_len - strlen("[%P] %H %N"));
+
+	format_buffer_start = format_buffer;
+
+	if ((str_pos = strstr(format_buffer, "%t"))) {
+		strcpy(file_format, "%t ");
+		format_buffer_start = str_pos + 2;
 	}
+
+	if ((str_pos = strstr(format_buffer, "%T"))) {
+		strcpy(file_format, "%T ");
+		format_buffer_start = str_pos + 2;
+	}
+
+	strcat(file_format, "[%P] %H %N");
+	strncat(file_format, format_buffer_start, buf_len - strlen(file_format));
 }
 
 int logsys_format_set (const char *format)
@@ -612,7 +619,7 @@ int logsys_format_set (const char *format)
 	}
 
 	/*
-	 * This just goes through and remove %t and %p from
+	 * This just goes through and remove %t, %T and %p from
 	 * the format string for syslog.
 	 */
 	w = 0;
@@ -625,7 +632,8 @@ int logsys_format_set (const char *format)
 					continue;
 				}
 				if (format_buffer[c] == 't' ||
-				    format_buffer[c] == 'p') {
+				    format_buffer[c] == 'p' ||
+				    format_buffer[c] == 'T') {
 					c++;
 				} else {
 					c = reminder;
@@ -767,9 +775,25 @@ static void _logsys_config_apply_per_subsys(int32_t s)
 	logsys_loggers[s].dirty = QB_FALSE;
 }
 
+static void _logsys_config_apply_blackbox(void) {
+	int blackbox_enable_res;
+
+	blackbox_enable_res = qb_log_ctl(QB_LOG_BLACKBOX, QB_LOG_CONF_ENABLED, logsys_blackbox_enabled);
+
+	if (blackbox_enable_res < 0) {
+		LOGSYS_PERROR (-blackbox_enable_res, LOGSYS_LEVEL_WARNING,
+		    "Unable to initialize log flight recorder. "\
+		    "The most common cause of this error is " \
+		    "not enough space on /dev/shm. Corosync will continue work, " \
+		    "but blackbox will not be available");
+	}
+}
+
 void logsys_config_apply(void)
 {
 	int32_t s;
+
+	_logsys_config_apply_blackbox();
 
 	for (s = 0; s <= LOGSYS_MAX_SUBSYS_COUNT; s++) {
 		if (strcmp(logsys_loggers[s].subsys, "") == 0) {
@@ -837,4 +861,75 @@ int logsys_thread_start (void)
 	logsys_thread_started = 1;
 
 	return (0);
+}
+
+void logsys_blackbox_set(int enable)
+{
+
+	pthread_mutex_lock (&logsys_config_mutex);
+
+	logsys_blackbox_enabled = enable;
+
+	pthread_mutex_unlock (&logsys_config_mutex);
+}
+
+/*
+ * To set correct pid to qb blackbox filename after tty dettach (fork) we have to
+ * close (this function) and (if needed) reopen blackbox (logsys_blackbox_postfork function).
+ */
+void logsys_blackbox_prefork(void)
+{
+
+	(void)qb_log_ctl(QB_LOG_BLACKBOX, QB_LOG_CONF_ENABLED, QB_FALSE);
+}
+
+void logsys_blackbox_postfork(void)
+{
+
+	_logsys_config_apply_blackbox();
+}
+
+cs_error_t logsys_reopen_log_files(void)
+{
+	cs_error_t res;
+
+#ifdef HAVE_QB_LOG_FILE_REOPEN
+	int i, j;
+	int num_using_current;
+	int32_t rc;
+
+	res = CS_OK;
+
+	pthread_mutex_lock (&logsys_config_mutex);
+
+	for (i = 0; i <= LOGSYS_MAX_SUBSYS_COUNT; i++) {
+		if (logsys_loggers[i].target_id <= 0 || logsys_loggers[i].logfile == NULL) {
+			continue ;
+		}
+
+		num_using_current = 0;
+		for (j = 0; j <= i; j++) {
+			if (logsys_loggers[i].target_id == logsys_loggers[j].target_id) {
+				num_using_current++;
+			}
+		}
+		if (num_using_current == 1) {
+			/*
+			 * First instance of target file. Reopen it.
+			 */
+			rc = qb_log_file_reopen(logsys_loggers[i].target_id, NULL);
+			if (rc != 0) {
+				LOGSYS_PERROR (-rc, LOGSYS_LEVEL_WARNING,
+				    "Unable to reopen log file %s", logsys_loggers[i].logfile);
+				res = qb_to_cs_error(rc);
+			}
+		}
+	}
+
+	pthread_mutex_unlock (&logsys_config_mutex);
+#else
+	res = CS_ERR_NOT_SUPPORTED;
+#endif
+
+	return (res);
 }

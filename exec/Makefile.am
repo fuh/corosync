@@ -33,33 +33,21 @@ MAINTAINERCLEANFILES	= Makefile.in
 
 noinst_HEADERS		= apidef.h cs_queue.h logconfig.h main.h \
 			  quorum.h service.h timer.h totemconfig.h \
-			  totemmrp.h totemnet.h totemudp.h totemiba.h \
-			  totemrrp.h totemudpu.h totemsrp.h util.h vsf.h \
+			  totemnet.h totemudp.h \
+			  totemudpu.h totemsrp.h util.h vsf.h \
 			  schedwrk.h sync.h fsm.h votequorum.h vsf_ykd.h \
-			  totemcrypto.h
-
-TOTEM_SRC		= totemip.c totemnet.c totemudp.c \
-			  totemudpu.c totemrrp.c totemsrp.c totemmrp.c \
-			  totempg.c totemcrypto.c
-
-if BUILD_RDMA
-TOTEM_SRC		+= totemiba.c
-endif
-
-lib_LTLIBRARIES		= libtotem_pg.la
-libtotem_pg_la_SOURCES	= $(TOTEM_SRC)
-libtotem_pg_la_CFLAGS	= $(nss_CFLAGS) $(rdmacm_CFLAGS) $(ibverbs_CFLAGS)
-libtotem_pg_la_LDFLAGS	= -version-number $(subst .,:,$(SONAME))
-libtotem_pg_la_LIBADD	= -lpthread $(LIBQB_LIBS) $(nss_LIBS) \
-			  $(rdmacm_LIBS) $(ibverbs_LIBS)
+			  totemknet.h stats.h ipcs_stats.h
 
 sbin_PROGRAMS		= corosync
 
 corosync_SOURCES	= vsf_ykd.c coroparse.c vsf_quorum.c sync.c \
 			  logsys.c cfg.c cmap.c cpg.c pload.c \
 			  votequorum.c util.c schedwrk.c main.c \
-			  apidef.c quorum.c icmap.c timer.c \
-			  ipc_glue.c service.c logconfig.c totemconfig.c
+			  apidef.c quorum.c icmap.c timer.c stats.c \
+			  ipc_glue.c service.c logconfig.c totemconfig.c \
+			  totemip.c totemnet.c totemudp.c \
+			  totemudpu.c totemsrp.c \
+			  totempg.c totemknet.c
 
 if BUILD_MONITORING
 corosync_SOURCES	+= mon.c
@@ -71,12 +59,12 @@ endif
 
 corosync_CPPFLAGS	= -DLOGCONFIG_USE_ICMAP=1
 
-corosync_CFLAGS         = $(statgrab_CFLAGS)
+corosync_CFLAGS         = $(statgrab_CFLAGS) $(libsystemd_CFLAGS) $(knet_CFLAGS) $(nozzle_CFLAGS)
 
-corosync_LDADD		= libtotem_pg.la ../common_lib/libcorosync_common.la \
-			  $(LIBQB_LIBS) $(statgrab_LIBS)
+corosync_LDADD		= ../common_lib/libcorosync_common.la \
+			  $(LIBQB_LIBS) $(statgrab_LIBS) $(libsystemd_LIBS) $(knet_LIBS) $(nozzle_LIBS)
 
-corosync_DEPENDENCIES	= libtotem_pg.la ../common_lib/libcorosync_common.la
+corosync_DEPENDENCIES	= ../common_lib/libcorosync_common.la
 
 lint:
 	-splint $(LINT_FLAGS) $(CPPFLAGS) $(CFLAGS) *.c

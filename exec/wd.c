@@ -44,7 +44,7 @@
 #include <corosync/corotypes.h>
 #include <corosync/corodefs.h>
 #include <corosync/coroapi.h>
-#include <corosync/list.h>
+#include <qb/qblist.h>
 #include <corosync/logsys.h>
 #include <corosync/icmap.h>
 #include "fsm.h"
@@ -89,6 +89,7 @@ static uint64_t tickle_timeout = (WD_DEFAULT_TIMEOUT_MS / 2);
 static int dog = -1;
 static corosync_timer_handle_t wd_timer;
 static int watchdog_ok = 1;
+static char *watchdog_device = NULL;
 
 struct corosync_service_engine wd_service_engine = {
 	.name			= "corosync watchdog service",
@@ -108,7 +109,7 @@ struct corosync_service_engine wd_service_engine = {
 	.exec_dump_fn		= NULL
 };
 
-static DECLARE_LIST_INIT (confchg_notify);
+static QB_LIST_DECLARE (confchg_notify);
 
 /*
  * F S M
@@ -220,15 +221,15 @@ static int32_t wd_resource_state_is_ok (struct resource *ref)
 	uint64_t allowed_period;
 	char key_name[ICMAP_KEYNAME_MAXLEN];
 
-	snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "%s%s", ref->res_path, "last_updated");
-	if (icmap_get_uint64(key_name, &last_updated) != CS_OK) {
+	if ((snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "%s%s", ref->res_path, "last_updated") >= ICMAP_KEYNAME_MAXLEN) ||
+		(icmap_get_uint64(key_name, &last_updated) != CS_OK)) {
 		/* key does not exist.
 		*/
 		return CS_FALSE;
 	}
 
-	snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "%s%s", ref->res_path, "state");
-	if (icmap_get_string(key_name, &state) != CS_OK || strcmp(state, "disabled") == 0) {
+	if ((snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "%s%s", ref->res_path, "state") >= ICMAP_KEYNAME_MAXLEN) ||
+		(icmap_get_string(key_name, &state) != CS_OK || strcmp(state, "disabled") == 0)) {
 		/* key does not exist.
 		*/
 		if (state != NULL)
@@ -278,8 +279,8 @@ static void wd_config_changed (struct cs_fsm* fsm, int32_t event, void * data)
 
 	next_timeout = ref->check_timeout;
 
-	snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "%s%s", ref->res_path, "poll_period");
-	if (icmap_get_uint64(ref->res_path, &tmp_value) == CS_OK) {
+	if ((snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "%s%s", ref->res_path, "poll_period") >= ICMAP_KEYNAME_MAXLEN) ||
+		(icmap_get_uint64(ref->res_path, &tmp_value) == CS_OK)) {
 		if (tmp_value >= WD_MIN_TIMEOUT_MS && tmp_value <= WD_MAX_TIMEOUT_MS) {
 			log_printf (LOGSYS_LEVEL_DEBUG,
 				"poll_period changing from:%"PRIu64" to %"PRIu64".",
@@ -298,8 +299,8 @@ static void wd_config_changed (struct cs_fsm* fsm, int32_t event, void * data)
 		}
 	}
 
-	snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "%s%s", ref->res_path, "recovery");
-	if (icmap_get_string(key_name, &ref->recovery) != CS_OK) {
+	if ((snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "%s%s", ref->res_path, "recovery") >= ICMAP_KEYNAME_MAXLEN) ||
+		(icmap_get_string(key_name, &ref->recovery) != CS_OK)) {
 		/* key does not exist.
 		 */
 		log_printf (LOGSYS_LEVEL_WARNING,
@@ -307,8 +308,8 @@ static void wd_config_changed (struct cs_fsm* fsm, int32_t event, void * data)
 		cs_fsm_state_set(&ref->fsm, WD_S_STOPPED, ref, wd_fsm_cb);
 		return;
 	}
-	snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "%s%s", ref->res_path, "state");
-	if (icmap_get_string(key_name, &state) != CS_OK) {
+	if ((snprintf(key_name, ICMAP_KEYNAME_MAXLEN, "%s%s", ref->res_path, "state") >= ICMAP_KEYNAME_MAXLEN) ||
+		(icmap_get_string(key_name, &state) != CS_OK)) {
 		/* key does not exist.
 		*/
 		log_printf (LOGSYS_LEVEL_WARNING,
@@ -585,7 +586,11 @@ static void wd_scan_resources (void)
 static void watchdog_timeout_apply (uint32_t new)
 {
 	struct watchdog_info ident;
-	uint32_t original_timeout = watchdog_timeout;
+	uint32_t original_timeout = 0;
+
+	if (dog > 0) {
+		ioctl(dog, WDIOC_GETTIMEOUT, &original_timeout);
+	}
 
 	if (new == original_timeout) {
 		return;
@@ -625,20 +630,37 @@ static void watchdog_timeout_apply (uint32_t new)
 static int setup_watchdog(void)
 {
 	struct watchdog_info ident;
+	char *str;
 
 	ENTER();
-	if (access ("/dev/watchdog", W_OK) != 0) {
-		log_printf (LOGSYS_LEVEL_WARNING, "No Watchdog, try modprobe <a watchdog>");
+
+	if (icmap_get_string("resources.watchdog_device", &str) == CS_OK) {
+		if (str[0] == 0 || strcmp (str, "off") == 0) {
+			log_printf (LOGSYS_LEVEL_WARNING, "Watchdog disabled by configuration");
+			free(str);
+			dog = -1;
+			return -1;
+		} else {
+			watchdog_device = str;
+		}
+	} else {
+		log_printf (LOGSYS_LEVEL_WARNING, "Watchdog not enabled by configuration");
+		dog = -1;
+		return -1;
+	}
+
+	if (access (watchdog_device, W_OK) != 0) {
+		log_printf (LOGSYS_LEVEL_WARNING, "No watchdog %s, try modprobe <a watchdog>", watchdog_device);
 		dog = -1;
 		return -1;
 	}
 
 	/* here goes, lets hope they have "Magic Close"
 	 */
-	dog = open("/dev/watchdog", O_WRONLY);
+	dog = open(watchdog_device, O_WRONLY);
 
 	if (dog == -1) {
-		log_printf (LOGSYS_LEVEL_WARNING, "Watchdog exists but couldn't be opened.");
+		log_printf (LOGSYS_LEVEL_WARNING, "Watchdog %s exists but couldn't be opened.", watchdog_device);
 		dog = -1;
 		return -1;
 	}
@@ -648,7 +670,7 @@ static int setup_watchdog(void)
 	 */
 
 	ioctl(dog, WDIOC_GETSUPPORT, &ident);
-	log_printf (LOGSYS_LEVEL_INFO, "Watchdog is now been tickled by corosync.");
+	log_printf (LOGSYS_LEVEL_INFO, "Watchdog %s is now being tickled by corosync.", watchdog_device);
 	log_printf (LOGSYS_LEVEL_DEBUG, "%s", ident.identity);
 
 	watchdog_timeout_apply (watchdog_timeout);
@@ -669,14 +691,16 @@ static void wd_top_level_key_changed(
 
 	ENTER();
 
-	if (icmap_get_uint32("resources.watchdog_timeout", &tmp_value_32) != CS_OK) {
+	if (icmap_get_uint32("resources.watchdog_timeout", &tmp_value_32) == CS_OK) {
 		if (tmp_value_32 >= 2 && tmp_value_32 <= 120) {
 			watchdog_timeout_apply (tmp_value_32);
+			return;
 		}
 	}
-	else {
-		watchdog_timeout_apply (WD_DEFAULT_TIMEOUT_SEC);
-	}
+
+	log_printf (LOGSYS_LEVEL_WARNING,
+		"Set watchdog_timeout is out of range (2..120).");
+	icmap_set_uint32("resources.watchdog_timeout", watchdog_timeout);
 }
 
 static void watchdog_timeout_get_initial (void)
@@ -694,8 +718,14 @@ static void watchdog_timeout_get_initial (void)
 	else {
 		if (tmp_value_32 >= 2 && tmp_value_32 <= 120) {
 			watchdog_timeout_apply (tmp_value_32);
-		} else {
+		}
+		else {
+			log_printf (LOGSYS_LEVEL_WARNING,
+				"Set watchdog_timeout is out of range (2..120).");
+			log_printf (LOGSYS_LEVEL_INFO,
+				"use default value %d seconds.", WD_DEFAULT_TIMEOUT_SEC);
 			watchdog_timeout_apply (WD_DEFAULT_TIMEOUT_SEC);
+			icmap_set_uint32("resources.watchdog_timeout", watchdog_timeout);
 		}
 	}
 
@@ -717,9 +747,6 @@ static char *wd_exec_init_fn (struct corosync_api_v1 *corosync_api)
 
 	wd_scan_resources();
 
-	api->timer_add_duration(tickle_timeout*MILLI_2_NANO_SECONDS, NULL,
-				wd_tickle_fn, &wd_timer);
-
 	return NULL;
 }
 
@@ -730,7 +757,9 @@ static int wd_exec_exit_fn (void)
 
 	if (dog > 0) {
 		log_printf (LOGSYS_LEVEL_INFO, "magically closing the watchdog.");
-		write (dog, &magic, 1);
+		if (write (dog, &magic, 1) == -1) {
+		    log_printf (LOGSYS_LEVEL_ERROR, "failed to write %c to dog(%d).", magic, dog);
+		}
 	}
 	return 0;
 }

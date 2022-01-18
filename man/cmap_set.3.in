@@ -91,19 +91,19 @@ parameter. Last parameter is
 .I type
 which gives type of value. It may be one of:
 .PP
-\fBCMAP_VALUETYPE_INT8\fR - 8-bit signed interger
+\fBCMAP_VALUETYPE_INT8\fR - 8-bit signed integer
 .PP
 \fBCMAP_VALUETYPE_UINT8\fR - 8-bit unsigned integer
 .PP
-\fBCMAP_VALUETYPE_INT16\fR - 16-bit signed interger
+\fBCMAP_VALUETYPE_INT16\fR - 16-bit signed integer
 .PP
 \fBCMAP_VALUETYPE_UINT16\fR - 16-bit unsigned integer
 .PP
-\fBCMAP_VALUETYPE_INT32\fR - 32-bit signed interger
+\fBCMAP_VALUETYPE_INT32\fR - 32-bit signed integer
 .PP
 \fBCMAP_VALUETYPE_UINT32\fR - 32-bit unsigned integer
 .PP
-\fBCMAP_VALUETYPE_INT64\fR - 64-bit signed interger
+\fBCMAP_VALUETYPE_INT64\fR - 64-bit signed integer
 .PP
 \fBCMAP_VALUETYPE_UINT64\fR - 64-bit unsigned integer
 .PP
@@ -119,9 +119,9 @@ which gives type of value. It may be one of:
 .SH RETURN VALUE
 This call returns the CS_OK value if successful. If value or key_name are unspecified, CS_ERR_INVALID_PARAM
 is returned. Too short or too long key_name returns CS_ERR_NAME_TOO_LONG error code. Some of keys may
-be tagged read-only directly in corosync and seting such key will result in CS_ERR_ACCESS error.
+be tagged read-only directly in corosync and setting such key will result in CS_ERR_ACCESS error.
 
 .SH "SEE ALSO"
 .BR cmap_get (3),
 .BR cmap_initialize (3),
-.BR cmap_overview (8)
+.BR cmap_overview (3)

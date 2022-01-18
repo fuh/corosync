@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2005-2006 MontaVista Software, Inc.
- * Copyright (c) 2006-2013 Red Hat, Inc.
+ * Copyright (c) 2006-2018 Red Hat, Inc.
  *
  * All rights reserved.
  *
@@ -45,6 +45,7 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <stddef.h>
 #include <limits.h>
 #include <errno.h>
 #include <string.h>
@@ -53,7 +54,8 @@
 #include <corosync/corotypes.h>
 #include <qb/qbipc_common.h>
 #include <corosync/cfg.h>
-#include <corosync/list.h>
+#include <qb/qblist.h>
+#include <qb/qbutil.h>
 #include <corosync/mar_gen.h>
 #include <corosync/totem/totemip.h>
 #include <corosync/totem/totem.h>
@@ -63,6 +65,8 @@
 #include <corosync/icmap.h>
 #include <corosync/corodefs.h>
 
+#include "totemconfig.h"
+#include "totemknet.h"
 #include "service.h"
 #include "main.h"
 
@@ -72,12 +76,14 @@ enum cfg_message_req_types {
         MESSAGE_REQ_EXEC_CFG_RINGREENABLE = 0,
 	MESSAGE_REQ_EXEC_CFG_KILLNODE = 1,
 	MESSAGE_REQ_EXEC_CFG_SHUTDOWN = 2,
-	MESSAGE_REQ_EXEC_CFG_RELOAD_CONFIG = 3
+	MESSAGE_REQ_EXEC_CFG_RELOAD_CONFIG = 3,
+	MESSAGE_REQ_EXEC_CFG_CRYPTO_RECONFIG = 4
 };
 
-#define DEFAULT_SHUTDOWN_TIMEOUT 5
+/* in milliseconds */
+#define DEFAULT_SHUTDOWN_TIMEOUT 5000
 
-static struct list_head trackers_list;
+static struct qb_list_head trackers_list;
 
 /*
  * Variables controlling a requested shutdown
@@ -91,7 +97,7 @@ static int shutdown_expected;
 
 struct cfg_info
 {
-	struct list_head list;
+	struct qb_list_head list;
 	void *conn;
 	void *tracker_conn;
 	enum {SHUTDOWN_REPLY_UNKNOWN, SHUTDOWN_REPLY_YES, SHUTDOWN_REPLY_NO} shutdown_reply;
@@ -128,9 +134,17 @@ static void message_handler_req_exec_cfg_reload_config (
         const void *message,
         unsigned int nodeid);
 
+static void message_handler_req_exec_cfg_reconfig_crypto (
+        const void *message,
+        unsigned int nodeid);
+
 static void exec_cfg_killnode_endian_convert (void *msg);
 
 static void message_handler_req_lib_cfg_ringstatusget (
+	void *conn,
+	const void *msg);
+
+static void message_handler_req_lib_cfg_nodestatusget (
 	void *conn,
 	const void *msg);
 
@@ -150,6 +164,14 @@ static void message_handler_req_lib_cfg_replytoshutdown (
 	void *conn,
 	const void *msg);
 
+static void message_handler_req_lib_cfg_trackstart (
+	void *conn,
+	const void *msg);
+
+static void message_handler_req_lib_cfg_trackstop (
+	void *conn,
+	const void *msg);
+
 static void message_handler_req_lib_cfg_get_node_addrs (
 	void *conn,
 	const void *msg);
@@ -159,6 +181,10 @@ static void message_handler_req_lib_cfg_local_get (
 	const void *msg);
 
 static void message_handler_req_lib_cfg_reload_config (
+	void *conn,
+	const void *msg);
+
+static void message_handler_req_lib_cfg_reopen_log_files (
 	void *conn,
 	const void *msg);
 
@@ -177,15 +203,15 @@ static struct corosync_lib_handler cfg_lib_engine[] =
 	},
 	{ /* 2 */
 		.lib_handler_fn		= message_handler_req_lib_cfg_killnode,
-		.flow_control		= CS_LIB_FLOW_CONTROL_NOT_REQUIRED
+		.flow_control		= CS_LIB_FLOW_CONTROL_REQUIRED
 	},
 	{ /* 3 */
 		.lib_handler_fn		= message_handler_req_lib_cfg_tryshutdown,
-		.flow_control		= CS_LIB_FLOW_CONTROL_NOT_REQUIRED
+		.flow_control		= CS_LIB_FLOW_CONTROL_REQUIRED
 	},
 	{ /* 4 */
 		.lib_handler_fn		= message_handler_req_lib_cfg_replytoshutdown,
-		.flow_control		= CS_LIB_FLOW_CONTROL_NOT_REQUIRED
+		.flow_control		= CS_LIB_FLOW_CONTROL_REQUIRED
 	},
 	{ /* 5 */
 		.lib_handler_fn		= message_handler_req_lib_cfg_get_node_addrs,
@@ -197,8 +223,25 @@ static struct corosync_lib_handler cfg_lib_engine[] =
 	},
 	{ /* 7 */
 		.lib_handler_fn		= message_handler_req_lib_cfg_reload_config,
+		.flow_control		= CS_LIB_FLOW_CONTROL_REQUIRED
+	},
+	{ /* 8 */
+		.lib_handler_fn		= message_handler_req_lib_cfg_reopen_log_files,
 		.flow_control		= CS_LIB_FLOW_CONTROL_NOT_REQUIRED
-	}
+	},
+	{ /* 9 */
+		.lib_handler_fn		= message_handler_req_lib_cfg_nodestatusget,
+		.flow_control		= CS_LIB_FLOW_CONTROL_NOT_REQUIRED
+	},
+	{ /* 10 */
+		.lib_handler_fn		= message_handler_req_lib_cfg_trackstart,
+		.flow_control		= CS_LIB_FLOW_CONTROL_REQUIRED
+	},
+	{ /* 11 */
+		.lib_handler_fn		= message_handler_req_lib_cfg_trackstop,
+		.flow_control		= CS_LIB_FLOW_CONTROL_REQUIRED
+	},
+
 };
 
 static struct corosync_exec_handler cfg_exec_engine[] =
@@ -215,6 +258,9 @@ static struct corosync_exec_handler cfg_exec_engine[] =
 	},
 	{ /* 3 */
 		.exec_handler_fn = message_handler_req_exec_cfg_reload_config,
+	},
+	{ /* 4 */
+		.exec_handler_fn = message_handler_req_exec_cfg_reconfig_crypto,
 	}
 };
 
@@ -253,6 +299,11 @@ struct req_exec_cfg_reload_config {
 	mar_message_source_t source __attribute__((aligned(8)));
 };
 
+struct req_exec_cfg_crypto_reconfig {
+	struct qb_ipc_request_header header __attribute__((aligned(8)));
+	mar_uint32_t phase __attribute__((aligned(8)));
+};
+
 struct req_exec_cfg_killnode {
 	struct qb_ipc_request_header header __attribute__((aligned(8)));
         mar_uint32_t nodeid __attribute__((aligned(8)));
@@ -270,7 +321,7 @@ static char *cfg_exec_init_fn (
 {
 	api = corosync_api_v1;
 
-	list_init(&trackers_list);
+	qb_list_init(&trackers_list);
 	return (NULL);
 }
 
@@ -309,7 +360,7 @@ static int send_shutdown(void)
 static void send_test_shutdown(void *only_conn, void *exclude_conn, int status)
 {
 	struct res_lib_cfg_testshutdown res_lib_cfg_testshutdown;
-	struct list_head *iter;
+	struct qb_list_head *iter;
 
 	ENTER();
 	res_lib_cfg_testshutdown.header.size = sizeof(struct res_lib_cfg_testshutdown);
@@ -322,8 +373,8 @@ static void send_test_shutdown(void *only_conn, void *exclude_conn, int status)
 		api->ipc_dispatch_send(only_conn, &res_lib_cfg_testshutdown,
 				       sizeof(res_lib_cfg_testshutdown));
 	} else {
-		for (iter = trackers_list.next; iter != &trackers_list; iter = iter->next) {
-			struct cfg_info *ci = list_entry(iter, struct cfg_info, list);
+		qb_list_for_each(iter, &trackers_list) {
+			struct cfg_info *ci = qb_list_entry(iter, struct cfg_info, list);
 
 			if (ci->conn != exclude_conn) {
 				TRACE1("sending testshutdown to %p", ci->tracker_conn);
@@ -428,9 +479,9 @@ static void remove_ci_from_shutdown(struct cfg_info *ci)
 		api->timer_delete(shutdown_timer);
 	}
 
-	if (!list_empty(&ci->list)) {
-		list_del(&ci->list);
-		list_init(&ci->list);
+	if (!qb_list_empty(&ci->list)) {
+		qb_list_del(&ci->list);
+		qb_list_init(&ci->list);
 
 		/*
 		 * Remove our option
@@ -469,7 +520,7 @@ static int cfg_lib_init_fn (void *conn)
 	struct cfg_info *ci = (struct cfg_info *)api->ipc_private_data_get (conn);
 
 	ENTER();
-	list_init(&ci->list);
+	qb_list_init(&ci->list);
 	LEAVE();
 
         return (0);
@@ -482,23 +533,8 @@ static void message_handler_req_exec_cfg_ringreenable (
         const void *message,
         unsigned int nodeid)
 {
-	const struct req_exec_cfg_ringreenable *req_exec_cfg_ringreenable
-	  = message;
-	struct res_lib_cfg_ringreenable res_lib_cfg_ringreenable;
-
 	ENTER();
-	api->totem_ring_reenable ();
-        if (api->ipc_source_is_local(&req_exec_cfg_ringreenable->source)) {
-		res_lib_cfg_ringreenable.header.id = MESSAGE_RES_CFG_RINGREENABLE;
-		res_lib_cfg_ringreenable.header.size = sizeof (struct res_lib_cfg_ringreenable);
-		res_lib_cfg_ringreenable.header.error = CS_OK;
-		api->ipc_response_send (
-			req_exec_cfg_ringreenable->source.conn,
-			&res_lib_cfg_ringreenable,
-			sizeof (struct res_lib_cfg_ringreenable));
 
-		api->ipc_refcnt_dec(req_exec_cfg_ringreenable->source.conn);
-	}
 	LEAVE();
 }
 
@@ -521,11 +557,11 @@ static void message_handler_req_exec_cfg_killnode (
 	cs_name_t reason;
 
 	ENTER();
-	log_printf(LOGSYS_LEVEL_DEBUG, "request to kill node %d(us=%d): %s",
-		req_exec_cfg_killnode->nodeid, api->totem_nodeid_get(), reason.value);
+	log_printf(LOGSYS_LEVEL_DEBUG, "request to kill node " CS_PRI_NODE_ID " (us=" CS_PRI_NODE_ID ")",
+		req_exec_cfg_killnode->nodeid, api->totem_nodeid_get());
         if (req_exec_cfg_killnode->nodeid == api->totem_nodeid_get()) {
 		marshall_from_mar_name_t(&reason, &req_exec_cfg_killnode->reason);
-		log_printf(LOGSYS_LEVEL_NOTICE, "Killed by node %d: %s",
+		log_printf(LOGSYS_LEVEL_NOTICE, "Killed by node " CS_PRI_NODE_ID " : %s",
 			   nodeid, reason.value);
 		corosync_fatal_error(COROSYNC_FATAL_ERROR_EXIT);
 	}
@@ -541,7 +577,7 @@ static void message_handler_req_exec_cfg_shutdown (
 {
 	ENTER();
 
-	log_printf(LOGSYS_LEVEL_NOTICE, "Node %d was shut down by sysadmin", nodeid);
+	log_printf(LOGSYS_LEVEL_NOTICE, "Node " CS_PRI_NODE_ID " was shut down by sysadmin", nodeid);
 	if (nodeid == api->totem_nodeid_get()) {
 		api->shutdown_request();
 	}
@@ -582,9 +618,13 @@ static void delete_and_notify_if_changed(icmap_map_t temp_map, const char *key_n
  */
 static void remove_ro_entries(icmap_map_t temp_map)
 {
+#ifndef HAVE_KNET_CRYPTO_RECONF
 	delete_and_notify_if_changed(temp_map, "totem.secauth");
 	delete_and_notify_if_changed(temp_map, "totem.crypto_hash");
 	delete_and_notify_if_changed(temp_map, "totem.crypto_cipher");
+	delete_and_notify_if_changed(temp_map, "totem.keyfile");
+	delete_and_notify_if_changed(temp_map, "totem.key");
+#endif
 	delete_and_notify_if_changed(temp_map, "totem.version");
 	delete_and_notify_if_changed(temp_map, "totem.threads");
 	delete_and_notify_if_changed(temp_map, "totem.ip_version");
@@ -596,11 +636,15 @@ static void remove_ro_entries(icmap_map_t temp_map)
 	delete_and_notify_if_changed(temp_map, "totem.interface.broadcast");
 	delete_and_notify_if_changed(temp_map, "totem.interface.mcastport");
 	delete_and_notify_if_changed(temp_map, "totem.interface.ttl");
-	delete_and_notify_if_changed(temp_map, "totem.vsftype");
 	delete_and_notify_if_changed(temp_map, "totem.transport");
 	delete_and_notify_if_changed(temp_map, "totem.cluster_name");
 	delete_and_notify_if_changed(temp_map, "quorum.provider");
-	delete_and_notify_if_changed(temp_map, "qb.ipc_type");
+	delete_and_notify_if_changed(temp_map, "system.move_to_root_cgroup");
+	delete_and_notify_if_changed(temp_map, "system.allow_knet_handle_fallback");
+	delete_and_notify_if_changed(temp_map, "system.sched_rr");
+	delete_and_notify_if_changed(temp_map, "system.priority");
+	delete_and_notify_if_changed(temp_map, "system.qb_ipc_type");
+	delete_and_notify_if_changed(temp_map, "system.state_dir");
 }
 
 /*
@@ -669,20 +713,25 @@ static void message_handler_req_exec_cfg_reload_config (
 {
 	const struct req_exec_cfg_reload_config *req_exec_cfg_reload_config = message;
 	struct res_lib_cfg_reload_config res_lib_cfg_reload_config;
+	struct totem_config new_config;
 	icmap_map_t temp_map;
 	const char *error_string;
 	int res = CS_OK;
 
 	ENTER();
 
-	log_printf(LOGSYS_LEVEL_NOTICE, "Config reload requested by node %d", nodeid);
+	log_printf(LOGSYS_LEVEL_NOTICE, "Config reload requested by node " CS_PRI_NODE_ID, nodeid);
 
+	icmap_set_uint8("config.totemconfig_reload_in_progress", 1);
+
+	/* Make sure there is no rubbish in this that might be checked, even on error */
+	memset(&new_config, 0, sizeof(new_config));
 	/*
 	 * Set up a new hashtable as a staging area.
 	 */
 	if ((res = icmap_init_r(&temp_map)) != CS_OK) {
 		log_printf(LOGSYS_LEVEL_ERROR, "Unable to create temporary icmap. config file reload cancelled\n");
-		goto reload_fini;
+		goto reload_fini_nomap;
 	}
 
 	/*
@@ -691,11 +740,11 @@ static void message_handler_req_exec_cfg_reload_config (
 	res = coroparse_configparse(temp_map, &error_string);
 	if (res == -1) {
 		log_printf (LOGSYS_LEVEL_ERROR, "Unable to reload config file: %s", error_string);
-		res = CS_ERR_LIBRARY;
-		goto reload_return;
+		res = CS_ERR_INVALID_PARAM;
+		goto reload_fini_nofree;
 	}
 
-	/* Tell interested listeners that we have started a reload */
+	/* Signal start of the reload process */
 	icmap_set_uint8("config.reload_in_progress", 1);
 
 	/* Detect deleted entries and remove them from the main icmap hashtable */
@@ -703,27 +752,114 @@ static void message_handler_req_exec_cfg_reload_config (
 	remove_deleted_entries(temp_map, "totem.");
 	remove_deleted_entries(temp_map, "nodelist.");
 	remove_deleted_entries(temp_map, "quorum.");
+	remove_deleted_entries(temp_map, "uidgid.config.");
+	remove_deleted_entries(temp_map, "nozzle.");
 
 	/* Remove entries that cannot be changed */
 	remove_ro_entries(temp_map);
 
+	/* Take a copy of the current setup so we can check what has changed */
+	memset(&new_config, 0, sizeof(new_config));
+	new_config.orig_interfaces = malloc (sizeof (struct totem_interface) * INTERFACE_MAX);
+	assert(new_config.orig_interfaces != NULL);
+
+	totempg_get_config(&new_config);
+	new_config.crypto_changed = 0;
+
+	new_config.interfaces = malloc (sizeof (struct totem_interface) * INTERFACE_MAX);
+	assert(new_config.interfaces != NULL);
+	memset(new_config.interfaces, 0, sizeof (struct totem_interface) * INTERFACE_MAX);
+
+	/* For UDP[U] the configuration on link0 is static (apart from the nodelist) and only read at
+	   startup. So preserve it here */
+	if ( (new_config.transport_number == TOTEM_TRANSPORT_UDP) ||
+	     (new_config.transport_number == TOTEM_TRANSPORT_UDPU)) {
+		memcpy(&new_config.interfaces[0], &new_config.orig_interfaces[0],
+		       sizeof(struct totem_interface));
+	}
+
+	/* Calculate new node and interface definitions */
+	if (totemconfig_configure_new_params(&new_config, temp_map, &error_string) == -1) {
+		log_printf (LOGSYS_LEVEL_ERROR, "Cannot configure new interface definitions: %s\n", error_string);
+		res = CS_ERR_INVALID_PARAM;
+		goto reload_fini;
+	}
+
+	/* Read from temp_map into new_config */
+	totem_volatile_config_read(&new_config, temp_map, NULL);
+
+	/* Get updated crypto parameters. Will set a flag in new_config if things have changed */
+	if (totem_reread_crypto_config(&new_config, temp_map, &error_string) == -1) {
+		log_printf (LOGSYS_LEVEL_ERROR, "Crypto configuration is not valid: %s\n", error_string);
+		res = CS_ERR_INVALID_PARAM;
+		goto reload_fini;
+	}
+
+	/* Validate dynamic parameters */
+	if (totem_volatile_config_validate(&new_config, temp_map, &error_string) == -1) {
+		log_printf (LOGSYS_LEVEL_ERROR, "Configuration is not valid: %s\n", error_string);
+		res = CS_ERR_INVALID_PARAM;
+		goto reload_fini;
+	}
+
+	/* Save this here so we can get at it for the later phases of crypto change */
+	if (new_config.crypto_changed) {
+#ifndef HAVE_KNET_CRYPTO_RECONF
+		new_config.crypto_changed = 0;
+		log_printf (LOGSYS_LEVEL_ERROR, "Crypto reconfiguration is not supported by the linked version of knet\n");
+		res = CS_ERR_INVALID_PARAM;
+		goto reload_fini;
+#endif
+	}
+
 	/*
 	 * Copy new keys into live config.
-	 * If this fails we will have a partially loaded config because some keys (above) might
-	 * have been reset to defaults - I'm not sure what to do here, we might have to quit.
 	 */
 	if ( (res = icmap_copy_map(icmap_get_global_map(), temp_map)) != CS_OK) {
 		log_printf (LOGSYS_LEVEL_ERROR, "Error making new config live. cmap database may be inconsistent\n");
+		/* Return res from icmap */
+		goto reload_fini;
 	}
 
-	/* All done - let clients know */
-	icmap_set_uint8("config.reload_in_progress", 0);
+	/* Copy into live system */
+	totempg_put_config(&new_config);
+	totemconfig_commit_new_params(&new_config, temp_map);
+	free(new_config.interfaces);
 
 reload_fini:
+	/* All done - let clients know */
+	icmap_set_int32("config.reload_status", res);
+	icmap_set_uint8("config.totemconfig_reload_in_progress", 0);
+	icmap_set_uint8("config.reload_in_progress", 0);
+
 	/* Finished with the temporary storage */
+	free(new_config.orig_interfaces);
+
+reload_fini_nofree:
 	icmap_fini_r(temp_map);
 
-reload_return:
+reload_fini_nomap:
+
+	/* If crypto was changed, now it's loaded on all nodes we can enable it.
+	 * Each node sends its own PHASE message so we're not relying on the leader
+	 * node to survive the transition
+	 */
+	if (new_config.crypto_changed) {
+		struct req_exec_cfg_crypto_reconfig req_exec_cfg_crypto_reconfig;
+		struct iovec iovec;
+
+		req_exec_cfg_crypto_reconfig.header.size =
+			sizeof (struct req_exec_cfg_crypto_reconfig);
+		req_exec_cfg_crypto_reconfig.header.id = SERVICE_ID_MAKE (CFG_SERVICE,
+									  MESSAGE_REQ_EXEC_CFG_CRYPTO_RECONFIG);
+		req_exec_cfg_crypto_reconfig.phase = CRYPTO_RECONFIG_PHASE_ACTIVATE;
+
+		iovec.iov_base = (char *)&req_exec_cfg_crypto_reconfig;
+		iovec.iov_len = sizeof (struct req_exec_cfg_crypto_reconfig);
+
+		assert (api->totem_mcast (&iovec, 1, TOTEM_SAFE) == 0);
+	}
+
 	/* All done, return result to the caller if it was on this system */
 	if (nodeid == api->totem_nodeid_get()) {
 		res_lib_cfg_reload_config.header.size = sizeof(res_lib_cfg_reload_config);
@@ -738,6 +874,46 @@ reload_return:
 	LEAVE();
 }
 
+/* Handle the phases of crypto reload
+ * The first time we are called is after the new crypto config has been loaded
+ * but not activated.
+ *
+ * 1 - activate the new crypto configuration
+ * 2 - clear out the old configuration
+ */
+static void message_handler_req_exec_cfg_reconfig_crypto (
+        const void *message,
+        unsigned int nodeid)
+{
+	const struct req_exec_cfg_crypto_reconfig *req_exec_cfg_crypto_reconfig = message;
+
+	/* Got our own reconfig message */
+	if (nodeid == api->totem_nodeid_get()) {
+		log_printf (LOGSYS_LEVEL_DEBUG, "Crypto reconfiguration phase %d", req_exec_cfg_crypto_reconfig->phase);
+
+		/* Do the deed */
+		totempg_crypto_reconfigure_phase(req_exec_cfg_crypto_reconfig->phase);
+
+		/* Move to the next phase if not finished */
+		if (req_exec_cfg_crypto_reconfig->phase < CRYPTO_RECONFIG_PHASE_CLEANUP) {
+			struct req_exec_cfg_crypto_reconfig req_exec_cfg_crypto_reconfig2;
+			struct iovec iovec;
+
+			req_exec_cfg_crypto_reconfig2.header.size =
+				sizeof (struct req_exec_cfg_crypto_reconfig);
+			req_exec_cfg_crypto_reconfig2.header.id = SERVICE_ID_MAKE (CFG_SERVICE,
+										   MESSAGE_REQ_EXEC_CFG_CRYPTO_RECONFIG);
+			req_exec_cfg_crypto_reconfig2.phase = CRYPTO_RECONFIG_PHASE_CLEANUP;
+
+			iovec.iov_base = (char *)&req_exec_cfg_crypto_reconfig2;
+			iovec.iov_len = sizeof (struct req_exec_cfg_crypto_reconfig);
+
+			assert (api->totem_mcast (&iovec, 1, TOTEM_SAFE) == 0);
+		}
+	}
+}
+
+
 /*
  * Library Interface Implementation
  */
@@ -750,6 +926,8 @@ static void message_handler_req_lib_cfg_ringstatusget (
 	unsigned int iface_count;
 	char **status;
 	const char *totem_ip_string;
+	char ifname[CFG_INTERFACE_NAME_MAX_LEN];
+	unsigned int iface_ids[INTERFACE_MAX];
 	unsigned int i;
 	cs_error_t res = CS_OK;
 
@@ -760,6 +938,7 @@ static void message_handler_req_lib_cfg_ringstatusget (
 
 	api->totem_ifaces_get (
 		api->totem_nodeid_get(),
+		iface_ids,
 		interfaces,
 		INTERFACE_MAX,
 		&status,
@@ -773,11 +952,17 @@ static void message_handler_req_lib_cfg_ringstatusget (
 		totem_ip_string
 		  = (const char *)api->totem_ip_print (&interfaces[i]);
 
-		if (strlen(totem_ip_string) >= CFG_INTERFACE_NAME_MAX_LEN) {
+		if (!totem_ip_string) {
+			totem_ip_string="";
+		}
+
+		/* Allow for i/f number at the start */
+		if (strlen(totem_ip_string) >= CFG_INTERFACE_NAME_MAX_LEN-3) {
 			log_printf(LOGSYS_LEVEL_ERROR, "String representation of interface %u is too long", i);
 			res = CS_ERR_NAME_TOO_LONG;
 			goto send_response;
 		}
+		snprintf(ifname, sizeof(ifname), "%d %s", iface_ids[i], totem_ip_string);
 
 		if (strlen(status[i]) >= CFG_INTERFACE_STATUS_MAX_LEN) {
 			log_printf(LOGSYS_LEVEL_ERROR, "Status string for interface %u is too long", i);
@@ -788,7 +973,7 @@ static void message_handler_req_lib_cfg_ringstatusget (
 		strcpy ((char *)&res_lib_cfg_ringstatusget.interface_status[i],
 			status[i]);
 		strcpy ((char *)&res_lib_cfg_ringstatusget.interface_name[i],
-			totem_ip_string);
+			ifname);
 	}
 
 send_response:
@@ -801,25 +986,153 @@ send_response:
 	LEAVE();
 }
 
+
+static void message_handler_req_lib_cfg_nodestatusget (
+	void *conn,
+	const void *msg)
+{
+	struct res_lib_cfg_nodestatusget_version res_lib_cfg_nodestatusget_version;
+	struct res_lib_cfg_nodestatusget_v1 res_lib_cfg_nodestatusget_v1;
+	void *res_lib_cfg_nodestatusget_ptr = NULL;
+	size_t res_lib_cfg_nodestatusget_size;
+	struct req_lib_cfg_nodestatusget *req_lib_cfg_nodestatusget = (struct req_lib_cfg_nodestatusget *)msg;
+	struct totem_node_status node_status;
+	int i;
+
+	ENTER();
+
+	memset(&node_status, 0, sizeof(node_status));
+	if (totempg_nodestatus_get(req_lib_cfg_nodestatusget->nodeid, &node_status) != 0) {
+		res_lib_cfg_nodestatusget_ptr = &res_lib_cfg_nodestatusget_version;
+		res_lib_cfg_nodestatusget_size = sizeof(res_lib_cfg_nodestatusget_version);
+
+		res_lib_cfg_nodestatusget_version.header.error = CS_ERR_FAILED_OPERATION;
+		res_lib_cfg_nodestatusget_version.header.id = MESSAGE_RES_CFG_NODESTATUSGET;
+		res_lib_cfg_nodestatusget_version.header.size = res_lib_cfg_nodestatusget_size;
+
+		goto ipc_response_send;
+	}
+
+	/* Currently only one structure version supported */
+	switch (req_lib_cfg_nodestatusget->version) {
+	case CFG_NODE_STATUS_V1:
+		res_lib_cfg_nodestatusget_ptr = &res_lib_cfg_nodestatusget_v1;
+		res_lib_cfg_nodestatusget_size = sizeof(res_lib_cfg_nodestatusget_v1);
+
+		res_lib_cfg_nodestatusget_v1.header.error = CS_OK;
+		res_lib_cfg_nodestatusget_v1.header.id = MESSAGE_RES_CFG_NODESTATUSGET;
+		res_lib_cfg_nodestatusget_v1.header.size = res_lib_cfg_nodestatusget_size;
+
+		res_lib_cfg_nodestatusget_v1.node_status.version = CFG_NODE_STATUS_V1;
+		res_lib_cfg_nodestatusget_v1.node_status.nodeid = req_lib_cfg_nodestatusget->nodeid;
+		res_lib_cfg_nodestatusget_v1.node_status.reachable = node_status.reachable;
+		res_lib_cfg_nodestatusget_v1.node_status.remote = node_status.remote;
+		res_lib_cfg_nodestatusget_v1.node_status.external = node_status.external;
+		res_lib_cfg_nodestatusget_v1.node_status.onwire_min = node_status.onwire_min;
+		res_lib_cfg_nodestatusget_v1.node_status.onwire_max = node_status.onwire_max;
+		res_lib_cfg_nodestatusget_v1.node_status.onwire_ver = node_status.onwire_ver;
+
+		for (i=0; i < KNET_MAX_LINK; i++) {
+			res_lib_cfg_nodestatusget_v1.node_status.link_status[i].enabled = node_status.link_status[i].enabled;
+			res_lib_cfg_nodestatusget_v1.node_status.link_status[i].connected = node_status.link_status[i].connected;
+			res_lib_cfg_nodestatusget_v1.node_status.link_status[i].dynconnected = node_status.link_status[i].dynconnected;
+			res_lib_cfg_nodestatusget_v1.node_status.link_status[i].mtu = node_status.link_status[i].mtu;
+			memcpy(res_lib_cfg_nodestatusget_v1.node_status.link_status[i].src_ipaddr,
+			       node_status.link_status[i].src_ipaddr, CFG_MAX_HOST_LEN);
+			memcpy(res_lib_cfg_nodestatusget_v1.node_status.link_status[i].dst_ipaddr,
+			       node_status.link_status[i].dst_ipaddr, CFG_MAX_HOST_LEN);
+		}
+		break;
+	default:
+		/*
+		 * Unsupported version requested
+		 */
+		res_lib_cfg_nodestatusget_ptr = &res_lib_cfg_nodestatusget_version;
+		res_lib_cfg_nodestatusget_size = sizeof(res_lib_cfg_nodestatusget_version);
+
+		res_lib_cfg_nodestatusget_version.header.error = CS_ERR_NOT_SUPPORTED;
+		res_lib_cfg_nodestatusget_version.header.id = MESSAGE_RES_CFG_NODESTATUSGET;
+		res_lib_cfg_nodestatusget_version.header.size = res_lib_cfg_nodestatusget_size;
+		break;
+	}
+
+ipc_response_send:
+	api->ipc_response_send (
+		conn,
+		res_lib_cfg_nodestatusget_ptr,
+		res_lib_cfg_nodestatusget_size);
+
+	LEAVE();
+}
+
+static void message_handler_req_lib_cfg_trackstart (
+	void *conn,
+	const void *msg)
+{
+	struct cfg_info *ci = (struct cfg_info *)api->ipc_private_data_get (conn);
+	struct res_lib_cfg_trackstart res_lib_cfg_trackstart;
+
+	ENTER();
+
+	/*
+	 * We only do shutdown tracking at the moment
+	 */
+	if (qb_list_empty(&ci->list)) {
+		qb_list_add(&ci->list, &trackers_list);
+		ci->tracker_conn = conn;
+
+		if (shutdown_con) {
+			/*
+			 * Shutdown already in progress, ask the newcomer's opinion
+			 */
+			ci->shutdown_reply = SHUTDOWN_REPLY_UNKNOWN;
+			shutdown_expected++;
+			send_test_shutdown(conn, NULL, CS_OK);
+		}
+	}
+
+	res_lib_cfg_trackstart.header.size = sizeof(struct res_lib_cfg_trackstart);
+	res_lib_cfg_trackstart.header.id = MESSAGE_RES_CFG_STATETRACKSTART;
+	res_lib_cfg_trackstart.header.error = CS_OK;
+
+	api->ipc_response_send(conn, &res_lib_cfg_trackstart,
+				    sizeof(res_lib_cfg_trackstart));
+
+	LEAVE();
+}
+
+static void message_handler_req_lib_cfg_trackstop (
+	void *conn,
+	const void *msg)
+{
+	struct cfg_info *ci = (struct cfg_info *)api->ipc_private_data_get (conn);
+	struct res_lib_cfg_trackstop res_lib_cfg_trackstop;
+
+	ENTER();
+	remove_ci_from_shutdown(ci);
+
+	res_lib_cfg_trackstop.header.size = sizeof(struct res_lib_cfg_trackstop);
+	res_lib_cfg_trackstop.header.id = MESSAGE_RES_CFG_STATETRACKSTOP;
+	res_lib_cfg_trackstop.header.error = CS_OK;
+
+	api->ipc_response_send(conn, &res_lib_cfg_trackstop,
+				    sizeof(res_lib_cfg_trackstop));
+	LEAVE();
+}
+
 static void message_handler_req_lib_cfg_ringreenable (
 	void *conn,
 	const void *msg)
 {
-	struct req_exec_cfg_ringreenable req_exec_cfg_ringreenable;
-	struct iovec iovec;
-
+	struct res_lib_cfg_ringreenable res_lib_cfg_ringreenable;
 	ENTER();
-	req_exec_cfg_ringreenable.header.size =
-		sizeof (struct req_exec_cfg_ringreenable);
-	req_exec_cfg_ringreenable.header.id = SERVICE_ID_MAKE (CFG_SERVICE,
-		MESSAGE_REQ_EXEC_CFG_RINGREENABLE);
-	api->ipc_source_set (&req_exec_cfg_ringreenable.source, conn);
-	api->ipc_refcnt_inc(conn);
 
-	iovec.iov_base = (char *)&req_exec_cfg_ringreenable;
-	iovec.iov_len = sizeof (struct req_exec_cfg_ringreenable);
-
-	assert (api->totem_mcast (&iovec, 1, TOTEM_SAFE) == 0);
+	res_lib_cfg_ringreenable.header.id = MESSAGE_RES_CFG_RINGREENABLE;
+	res_lib_cfg_ringreenable.header.size = sizeof (struct res_lib_cfg_ringreenable);
+	res_lib_cfg_ringreenable.header.error = CS_ERR_NOT_SUPPORTED;
+	api->ipc_response_send (
+		conn, &res_lib_cfg_ringreenable,
+		sizeof (struct res_lib_cfg_ringreenable));
 
 	LEAVE();
 }
@@ -832,8 +1145,48 @@ static void message_handler_req_lib_cfg_killnode (
 	struct res_lib_cfg_killnode res_lib_cfg_killnode;
 	struct req_exec_cfg_killnode req_exec_cfg_killnode;
 	struct iovec iovec;
+	char key_name[ICMAP_KEYNAME_MAXLEN];
+	char tmp_key[ICMAP_KEYNAME_MAXLEN + 1];
+	icmap_map_t map;
+	icmap_iter_t iter;
+	const char *iter_key;
+	uint32_t nodeid;
+	char *status_str = NULL;
+	int match_nodeid_flag = 0;
+	cs_error_t error = CS_OK;
 
 	ENTER();
+
+	map = icmap_get_global_map();
+	iter = icmap_iter_init_r(map, "runtime.members.");
+	while ((iter_key = icmap_iter_next(iter, NULL, NULL)) != NULL) {
+		if (sscanf(iter_key, "runtime.members.%u.%s", &nodeid, key_name) != 2) {
+			continue;
+		}
+		if (strcmp(key_name, "status") != 0) {
+			continue;
+		}
+		if (nodeid != req_lib_cfg_killnode->nodeid) {
+			continue;
+		}
+		match_nodeid_flag = 1;
+		snprintf(tmp_key, ICMAP_KEYNAME_MAXLEN, "runtime.members.%u.status", nodeid);
+		if (icmap_get_string_r(map, tmp_key, &status_str) != CS_OK) {
+			error = CS_ERR_LIBRARY;
+			goto send_response;
+		}
+		if (strcmp(status_str, "joined") != 0) {
+			error = CS_ERR_NOT_EXIST;
+			goto send_response;
+		}
+		break;
+	}
+
+	if (!match_nodeid_flag) {
+		error = CS_ERR_NOT_EXIST;
+		goto send_response;
+	}
+
 	req_exec_cfg_killnode.header.size =
 		sizeof (struct req_exec_cfg_killnode);
 	req_exec_cfg_killnode.header.id = SERVICE_ID_MAKE (CFG_SERVICE,
@@ -846,13 +1199,16 @@ static void message_handler_req_lib_cfg_killnode (
 
 	(void)api->totem_mcast (&iovec, 1, TOTEM_SAFE);
 
+send_response:
 	res_lib_cfg_killnode.header.size = sizeof(struct res_lib_cfg_killnode);
 	res_lib_cfg_killnode.header.id = MESSAGE_RES_CFG_KILLNODE;
-	res_lib_cfg_killnode.header.error = CS_OK;
+	res_lib_cfg_killnode.header.error = error;
 
 	api->ipc_response_send(conn, &res_lib_cfg_killnode,
 				    sizeof(res_lib_cfg_killnode));
 
+	free(status_str);
+	icmap_iter_finalize(iter);
 	LEAVE();
 }
 
@@ -863,7 +1219,7 @@ static void message_handler_req_lib_cfg_tryshutdown (
 {
 	struct cfg_info *ci = (struct cfg_info *)api->ipc_private_data_get (conn);
 	const struct req_lib_cfg_tryshutdown *req_lib_cfg_tryshutdown = msg;
-	struct list_head *iter;
+	struct qb_list_head *iter;
 
 	ENTER();
 
@@ -915,8 +1271,8 @@ static void message_handler_req_lib_cfg_tryshutdown (
 	 */
 	shutdown_expected = 0;
 
-	for (iter = trackers_list.next; iter != &trackers_list; iter = iter->next) {
-		struct cfg_info *testci = list_entry(iter, struct cfg_info, list);
+	qb_list_for_each(iter, &trackers_list) {
+		struct cfg_info *testci = qb_list_entry(iter, struct cfg_info, list);
 		/*
 		 * It is assumed that we will allow shutdown
 		 */
@@ -958,7 +1314,7 @@ static void message_handler_req_lib_cfg_tryshutdown (
 		 * Start the timer. If we don't get a full set of replies before this goes
 		 * off we'll cancel the shutdown
 		 */
-		api->timer_add_duration((unsigned long long)shutdown_timeout*1000000000, NULL,
+		api->timer_add_duration((unsigned long long)shutdown_timeout*QB_TIME_NS_IN_MSEC, NULL,
 					shutdown_timer_fn, &shutdown_timer);
 
 		/*
@@ -1015,11 +1371,14 @@ static void message_handler_req_lib_cfg_get_node_addrs (void *conn,
 							const void *msg)
 {
 	struct totem_ip_address node_ifs[INTERFACE_MAX];
+	unsigned int iface_ids[INTERFACE_MAX];
 	char buf[PIPE_BUF];
 	char **status;
 	unsigned int num_interfaces = 0;
+	struct sockaddr_storage *ss;
 	int ret = CS_OK;
 	int i;
+	int live_addrs = 0;
 	const struct req_lib_cfg_get_node_addrs *req_lib_cfg_get_node_addrs = msg;
 	struct res_lib_cfg_get_node_addrs *res_lib_cfg_get_node_addrs = (struct res_lib_cfg_get_node_addrs *)buf;
 	unsigned int nodeid = req_lib_cfg_get_node_addrs->nodeid;
@@ -1028,18 +1387,26 @@ static void message_handler_req_lib_cfg_get_node_addrs (void *conn,
 	if (nodeid == 0)
 		nodeid = api->totem_nodeid_get();
 
-	api->totem_ifaces_get(nodeid, node_ifs, INTERFACE_MAX, &status, &num_interfaces);
+	if (api->totem_ifaces_get(nodeid, iface_ids, node_ifs, INTERFACE_MAX, &status, &num_interfaces)) {
+		ret = CS_ERR_EXIST;
+		num_interfaces = 0;
+	}
 
 	res_lib_cfg_get_node_addrs->header.size = sizeof(struct res_lib_cfg_get_node_addrs) + (num_interfaces * TOTEMIP_ADDRLEN);
 	res_lib_cfg_get_node_addrs->header.id = MESSAGE_RES_CFG_GET_NODE_ADDRS;
 	res_lib_cfg_get_node_addrs->header.error = ret;
-	res_lib_cfg_get_node_addrs->num_addrs = num_interfaces;
 	if (num_interfaces) {
 		res_lib_cfg_get_node_addrs->family = node_ifs[0].family;
 		for (i = 0, addr_buf = (char *)res_lib_cfg_get_node_addrs->addrs;
-		    i < num_interfaces; i++, addr_buf += TOTEMIP_ADDRLEN) {
-			memcpy(addr_buf, node_ifs[i].addr, TOTEMIP_ADDRLEN);
+		    i < num_interfaces; i++) {
+			ss = (struct sockaddr_storage *)&node_ifs[i].addr;
+			if (ss->ss_family) {
+				memcpy(addr_buf, node_ifs[i].addr, TOTEMIP_ADDRLEN);
+				live_addrs++;
+				addr_buf += TOTEMIP_ADDRLEN;
+			}
 		}
+		res_lib_cfg_get_node_addrs->num_addrs = live_addrs;
 	} else {
 		res_lib_cfg_get_node_addrs->header.error = CS_ERR_NOT_EXIST;
 	}
@@ -1077,6 +1444,27 @@ static void message_handler_req_lib_cfg_reload_config (void *conn, const void *m
 	iovec.iov_len = sizeof (struct req_exec_cfg_reload_config);
 
 	assert (api->totem_mcast (&iovec, 1, TOTEM_SAFE) == 0);
+
+	LEAVE();
+}
+
+static void message_handler_req_lib_cfg_reopen_log_files (void *conn, const void *msg)
+{
+	struct res_lib_cfg_reopen_log_files res_lib_cfg_reopen_log_files;
+	cs_error_t res;
+
+	ENTER();
+
+	log_printf(LOGSYS_LEVEL_DEBUG, "Reopening logging files\n");
+
+	res = logsys_reopen_log_files();
+
+	res_lib_cfg_reopen_log_files.header.size = sizeof(res_lib_cfg_reopen_log_files);
+	res_lib_cfg_reopen_log_files.header.id = MESSAGE_RES_CFG_REOPEN_LOG_FILES;
+	res_lib_cfg_reopen_log_files.header.error = res;
+	api->ipc_response_send(conn,
+			       &res_lib_cfg_reopen_log_files,
+			       sizeof(res_lib_cfg_reopen_log_files));
 
 	LEAVE();
 }

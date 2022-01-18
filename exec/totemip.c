@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2005-2011 Red Hat, Inc.
+ * Copyright (c) 2005-2020 Red Hat, Inc.
  *
  * All rights reserved.
  *
@@ -52,6 +52,7 @@
 #include <ifaddrs.h>
 
 #include <corosync/totem/totemip.h>
+#include <corosync/logsys.h>
 #include <corosync/swab.h>
 
 #define LOCALHOST_IPV4 "127.0.0.1"
@@ -91,19 +92,38 @@ int totemip_equal(const struct totem_ip_address *addr1,
 
 }
 
+int totemip_sa_equal(const struct totem_ip_address *totem_ip,
+	const struct sockaddr *sa)
+{
+	int res;
+
+	res = 0;
+
+	if (totem_ip->family != sa->sa_family) {
+		return (res);
+	}
+
+	switch (totem_ip->family) {
+	case AF_INET:
+		res = (memcmp(totem_ip->addr,
+		    &((const struct sockaddr_in *)sa)->sin_addr, sizeof(struct in_addr)) == 0);
+		break;
+	case AF_INET6:
+		res =  (memcmp(totem_ip->addr,
+		    &((const struct sockaddr_in6 *)sa)->sin6_addr, sizeof(struct in6_addr)) == 0);
+		break;
+	default:
+		assert(0);
+	}
+
+	return (res);
+}
+
 /* Copy a totem_ip_address */
 void totemip_copy(struct totem_ip_address *addr1,
 		  const struct totem_ip_address *addr2)
 {
 	memcpy(addr1, addr2, sizeof(struct totem_ip_address));
-}
-
-void totemip_copy_endian_convert(struct totem_ip_address *addr1,
-				 const struct totem_ip_address *addr2)
-{
-	addr1->nodeid = swab32(addr2->nodeid);
-	addr1->family = swab16(addr2->family);
-	memcpy(addr1->addr, addr2->addr, TOTEMIP_ADDRLEN);
 }
 
 /*
@@ -211,6 +231,28 @@ int totemip_localhost_check(const struct totem_ip_address *addr)
 	return totemip_equal(addr, &localhost);
 }
 
+const char *totemip_sa_print(const struct sockaddr *sa)
+{
+	static char buf[INET6_ADDRSTRLEN];
+
+	buf[0] = 0;
+
+	switch (sa->sa_family) {
+	case AF_INET:
+		inet_ntop(sa->sa_family, &((struct sockaddr_in *)(sa))->sin_addr, buf,
+		    INET6_ADDRSTRLEN);
+		break;
+	case AF_INET6:
+		inet_ntop(sa->sa_family, &((struct sockaddr_in6 *)(sa))->sin6_addr, buf,
+		    INET6_ADDRSTRLEN);
+		break;
+	default:
+		return (NULL);
+	}
+
+	return (buf);
+}
+
 const char *totemip_print(const struct totem_ip_address *addr)
 {
 	static char buf[INET6_ADDRSTRLEN];
@@ -257,38 +299,121 @@ int totemip_totemip_to_sockaddr_convert(struct totem_ip_address *ip_addr,
 	return ret;
 }
 
-/* Converts an address string string into a totem_ip_address.
-   family can be AF_INET, AF_INET6 or 0 ("for "don't care")
-*/
-int totemip_parse(struct totem_ip_address *totemip, const char *addr, int family)
+/*
+ * Converts an address string string into a totem_ip_address. ip_version enum
+ * defines order.
+ */
+int totemip_parse(struct totem_ip_address *totemip, const char *addr,
+    enum totem_ip_version_enum ip_version)
 {
 	struct addrinfo *ainfo;
+	struct addrinfo *ainfo_iter;
+	struct addrinfo *ainfo_ipv4;
+	struct addrinfo *ainfo_ipv6;
+	struct addrinfo *ainfo_final;
 	struct addrinfo ahints;
 	struct sockaddr_in *sa;
 	struct sockaddr_in6 *sa6;
 	int ret;
+	int debug_ip_family;
+	int ai_family;
 
 	memset(&ahints, 0, sizeof(ahints));
 	ahints.ai_socktype = SOCK_DGRAM;
 	ahints.ai_protocol = IPPROTO_UDP;
-	ahints.ai_family   = family;
 
-	/* Lookup the nodename address */
+	ai_family = AF_UNSPEC;
+	debug_ip_family = 0;
+
+	switch (ip_version) {
+	case TOTEM_IP_VERSION_4:
+		ai_family = AF_INET;
+		debug_ip_family = 4;
+		break;
+	case TOTEM_IP_VERSION_6:
+		ai_family = AF_INET6;
+		debug_ip_family = 6;
+		break;
+	case TOTEM_IP_VERSION_6_4:
+	case TOTEM_IP_VERSION_4_6:
+		/*
+		 * ai_family and debug_ip_family are already set correctly
+		 */
+		break;
+	}
+
+	ahints.ai_family = ai_family;
+
 	ret = getaddrinfo(addr, NULL, &ahints, &ainfo);
-	if (ret)
-		return -1;
 
-	sa = (struct sockaddr_in *)ainfo->ai_addr;
-	sa6 = (struct sockaddr_in6 *)ainfo->ai_addr;
-	totemip->family = ainfo->ai_family;
+	if (ret == 0 && ai_family == AF_UNSPEC) {
+		ainfo_ipv4 = ainfo_ipv6 = NULL;
 
-	if (ainfo->ai_family == AF_INET)
+		/*
+		 * Walk thru results and store first AF_INET and AF_INET6
+		 */
+		for (ainfo_iter = ainfo; ainfo_iter != NULL; ainfo_iter = ainfo_iter->ai_next) {
+			if (ainfo_iter->ai_family == AF_INET && ainfo_ipv4 == NULL) {
+				ainfo_ipv4 = ainfo_iter;
+			}
+
+			if (ainfo_iter->ai_family == AF_INET6 && ainfo_ipv6 == NULL) {
+				ainfo_ipv6 = ainfo_iter;
+			}
+		}
+
+		if (ip_version == TOTEM_IP_VERSION_6_4) {
+			if (ainfo_ipv6 != NULL) {
+				ainfo_final = ainfo_ipv6;
+			} else {
+				ainfo_final = ainfo_ipv4;
+			}
+		} else {
+			if (ainfo_ipv4 != NULL) {
+				ainfo_final = ainfo_ipv4;
+			} else {
+				ainfo_final = ainfo_ipv6;
+			}
+		}
+	} else if (ret == 0) {
+		ainfo_final = ainfo;
+	} else {
+		ainfo_final = NULL;
+	}
+
+	if (ainfo_final == NULL) {
+		if (ret == 0) {
+			freeaddrinfo(ainfo);
+		}
+
+		if (debug_ip_family == 0) {
+			log_printf(LOGSYS_LEVEL_DEBUG, "totemip_parse: IP address of %s not resolvable",
+			    addr);
+		} else {
+			log_printf(LOGSYS_LEVEL_DEBUG, "totemip_parse: IPv%u address of %s not resolvable",
+			    debug_ip_family, addr);
+		}
+
+		return (-1);
+	}
+
+	totemip->family = ainfo_final->ai_family;
+	if (ainfo_final->ai_family == AF_INET) {
+		sa = (struct sockaddr_in *)ainfo_final->ai_addr;
 		memcpy(totemip->addr, &sa->sin_addr, sizeof(struct in_addr));
-	else
+		debug_ip_family = 4;
+	} else {
+		sa6 = (struct sockaddr_in6 *)ainfo_final->ai_addr;
 		memcpy(totemip->addr, &sa6->sin6_addr, sizeof(struct in6_addr));
+		debug_ip_family = 6;
+	}
+
+	log_printf(LOGSYS_LEVEL_DEBUG, "totemip_parse: IPv%u address of %s resolved as %s",
+		    debug_ip_family, addr, totemip_print(totemip));
 
 	freeaddrinfo(ainfo);
-	return 0;
+
+	return (0);
 }
 
 /* Make a sockaddr_* into a totem_ip_address */
@@ -318,7 +443,7 @@ int totemip_sockaddr_to_totemip_convert(const struct sockaddr_storage *saddr,
 	return ret;
 }
 
-int totemip_getifaddrs(struct list_head *addrs)
+int totemip_getifaddrs(struct qb_list_head *addrs)
 {
 	struct ifaddrs *ifap, *ifa;
 	struct totem_ip_if_address *if_addr;
@@ -326,7 +451,7 @@ int totemip_getifaddrs(struct list_head *addrs)
 	if (getifaddrs(&ifap) != 0)
 		return (-1);
 
-	list_init(addrs);
+	qb_list_init(addrs);
 
 	for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
 		if (ifa->ifa_addr == NULL || ifa->ifa_netmask == NULL)
@@ -346,7 +471,7 @@ int totemip_getifaddrs(struct list_head *addrs)
 			goto error_free_ifaddrs;
 		}
 
-		list_init(&if_addr->list);
+		qb_list_init(&if_addr->list);
 
 		memset(if_addr, 0, sizeof(struct totem_ip_if_address));
 
@@ -367,7 +492,7 @@ int totemip_getifaddrs(struct list_head *addrs)
 			goto error_free_addr_name;
 		}
 
-		list_add_tail(&if_addr->list, addrs);
+		qb_list_add_tail(&if_addr->list, addrs);
 	}
 
 	freeifaddrs(ifap);
@@ -386,20 +511,19 @@ error_free_ifaddrs:
 	return (-1);
 }
 
-void totemip_freeifaddrs(struct list_head *addrs)
+void totemip_freeifaddrs(struct qb_list_head *addrs)
 {
 	struct totem_ip_if_address *if_addr;
-	struct list_head *list;
+	struct qb_list_head *list, *tmp_iter;
 
-	for (list = addrs->next; list != addrs;) {
-		if_addr = list_entry(list, struct totem_ip_if_address, list);
-		list = list->next;
+	qb_list_for_each_safe(list, tmp_iter, addrs) {
+		if_addr = qb_list_entry(list, struct totem_ip_if_address, list);
 
 		free(if_addr->name);
-		list_del(&if_addr->list);
+		qb_list_del(&if_addr->list);
 	        free(if_addr);
 	}
-	list_init(addrs);
+	qb_list_init(addrs);
 }
 
 int totemip_iface_check(struct totem_ip_address *bindnet,
@@ -408,8 +532,8 @@ int totemip_iface_check(struct totem_ip_address *bindnet,
 			int *interface_num,
 			int mask_high_bit)
 {
-	struct list_head addrs;
-	struct list_head *list;
+	struct qb_list_head addrs;
+	struct qb_list_head *list;
 	struct totem_ip_if_address *if_addr;
 	struct totem_ip_address bn_netaddr, if_netaddr;
 	socklen_t addr_len;
@@ -425,8 +549,8 @@ int totemip_iface_check(struct totem_ip_address *bindnet,
 		return (-1);
 	}
 
-	for (list = addrs.next; list != &addrs; list = list->next) {
-		if_addr = list_entry(list, struct totem_ip_if_address, list);
+	qb_list_for_each(list, &addrs) {
+		if_addr = qb_list_entry(list, struct totem_ip_if_address, list);
 
 		if (bindnet->family != if_addr->ip_addr.family)
 			continue ;
@@ -462,18 +586,6 @@ int totemip_iface_check(struct totem_ip_address *bindnet,
 			boundto->nodeid = bindnet->nodeid;
 			*interface_up = if_addr->interface_up;
 			*interface_num = if_addr->interface_num;
-
-			if (boundto->family == AF_INET && boundto->nodeid == 0) {
-				unsigned int nodeid = 0;
-				memcpy (&nodeid, boundto->addr, sizeof (int));
-#if __BYTE_ORDER == __LITTLE_ENDIAN
-                                nodeid = swab32 (nodeid);
-#endif
-				if (mask_high_bit) {
-					nodeid &= 0x7FFFFFFF;
-				}
-				boundto->nodeid = nodeid;
-			}
 
 			net_match_found = 1;
 			res = 0;

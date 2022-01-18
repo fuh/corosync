@@ -37,6 +37,8 @@ MAINTAINERCLEANFILES	= Makefile.in
 xml_man			= corosync-xmlproc.8 \
 			  corosync.xml.5
 
+corosync_vqsim_man	= corosync-vqsim.8
+
 INDEX_HTML		= index.html
 
 autogen_man		= cpg_context_get.3 \
@@ -58,6 +60,7 @@ autogen_man		= cpg_context_get.3 \
 			  cpg_iteration_initialize.3 \
 			  cpg_iteration_next.3 \
 			  quorum_initialize.3 \
+			  quorum_model_initialize.3 \
 			  quorum_finalize.3 \
 			  quorum_fd_get.3 \
 			  quorum_dispatch.3 \
@@ -106,6 +109,7 @@ autogen_man		= cpg_context_get.3 \
 			  cmap_finalize.3 \
 			  cmap_dispatch.3  \
 			  cmap_initialize.3 \
+			  cmap_initialize_map.3 \
 			  cmap_track_add.3 \
 			  cmap_context_set.3 \
 			  cmap_fd_get.3 \
@@ -115,6 +119,7 @@ autogen_common		= ipc_common.sh.errors
 
 EXTRA_DIST		= $(INDEX_HTML) \
 			  $(xml_man) \
+			  $(corosync_vqsim_man) \
 			  $(autogen_man:%=%.in) \
 			  $(autogen_common)
 
@@ -130,13 +135,17 @@ dist_man_MANS 		= corosync.conf.5 \
 			  corosync-cpgtool.8 \
 			  corosync-notifyd.8 \
 			  corosync-quorumtool.8 \
-			  corosync_overview.8 \
-			  cpg_overview.8 \
-			  quorum_overview.8 \
-			  votequorum_overview.8 \
-			  sam_overview.8 \
-			  cmap_overview.8 \
-			  cmap_keys.8
+			  corosync_overview.7 \
+			  cpg_overview.3 \
+			  quorum_overview.3 \
+			  votequorum_overview.3 \
+			  sam_overview.3 \
+			  cmap_overview.3 \
+			  cmap_keys.7
+
+if BUILD_VQSIM
+dist_man_MANS		+= $(corosync_vqsim_man)
+endif
 
 if INSTALL_XMLCONF
 dist_man_MANS		+= $(xml_man)
@@ -148,14 +157,16 @@ HTML_DOCS 		= $(dist_man_MANS:%=%.html) $(man_MANS:%=%.html)
 %.3: %.3.in $(autogen_common)
 	@echo Generating $@ man page && \
 	rm -f $@-t-t $@-t $@ && \
-	date="$$(LC_ALL=C date "+%F")" && \
-	awk "{print}(\$$1 ~ /@COMMONIPCERRORS@/){exit 0}" ${top_srcdir}/man/$@.in > $@-t-t && \
+	DATE_FMT="%Y-%m-%d" && \
+	SOURCE_DATE_EPOCH="$${SOURCE_DATE_EPOCH:-$$(date +%s)}" && \
+	date="$$(date -u -d "@$$SOURCE_DATE_EPOCH" "+$$DATE_FMT" 2>/dev/null || date -u -r "$$SOURCE_DATE_EPOCH" "+$$DATE_FMT" 2>/dev/null || date -u "+$$DATE_FMT")" && \
+	$(AWK) "{print}(\$$1 ~ /@COMMONIPCERRORS@/){exit 0}" ${top_srcdir}/man/$@.in > $@-t-t && \
 	cat ${top_srcdir}/man/$(autogen_common) >> $@-t-t && \
-	awk -v p=0 "(\$$1 ~ /@COMMONIPCERRORS@/){p = 1} {if(p==1)print}" ${top_srcdir}/man/$@.in >> $@-t-t && \
+	$(AWK) -v p=0 "(\$$1 ~ /@COMMONIPCERRORS@/){p = 1} {if(p==1)print}" ${top_srcdir}/man/$@.in >> $@-t-t && \
 	cat $@-t-t | \
-		sed -e 's#@BUILDDATE@#'$$date'#g' \
-		    -e 's#@COMMONIPCERRORS@##g' \
-		    > $@-t && \
+		$(SED) -e 's#@BUILDDATE@#'$$date'#g' \
+		       -e 's#@COMMONIPCERRORS@##g' \
+		       > $@-t && \
 	rm -f $@-t-t && \
 	mv $@-t $@
 

@@ -31,9 +31,10 @@
 .\" * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
 .\" * THE POSSIBILITY OF SUCH DAMAGE.
 .\" */
-.TH CPG_ZCB_ALLOC 2009-04-15 "corosync Man Page" "Corosync Cluster Engine Programmer's Manual"
+.TH "CPG_ZCB_ALLOC" 3 "2009-04-15" "corosync Man Page" "Corosync Cluster Engine Programmer's Manual"
 .SH NAME
 cpg_zcb_alloc \- Allocates a zero copy buffer
+.SH SYNOPSIS
 .B #include <corosync/cpg.h>
 .sp
 .BI "int cpg_zcb_alloc(cpg_handle_t " handle ", size_t " size ", void **" buffer ");
@@ -42,7 +43,7 @@ The
 .B cpg_zcb_alloc
 function will allocate a zero copy buffer for use with the
 .B cpg_zcb_mcast_joined(3)
-funtion.  This buffer should not be used in another thread while a
+function.  This buffer should not be used in another thread while a
 cpg_zcb_mcast_joined operation is taking place on the buffer.  The buffer is
 allocated via operating system mechanisms to avoid copying in the IPC layer.
 
@@ -57,7 +58,7 @@ requests a buffer of size be allocated.
 .PP
 The
 .I buffer
-argument is set to the buffer address that is allocated by this operatoin.
+argument is set to the buffer address that is allocated by this operation.
 
 .SH RETURN VALUE
 This call returns the CS_OK value if successful, otherwise an error is returned.
@@ -65,7 +66,7 @@ This call returns the CS_OK value if successful, otherwise an error is returned.
 .SH ERRORS
 The errors are undocumented.
 .SH "SEE ALSO"
-.BR cpg_overview (8),
+.BR cpg_overview (3),
 .BR cpg_initialize (3),
 .BR cpg_finalize (3),
 .BR cpg_fd_get (3),

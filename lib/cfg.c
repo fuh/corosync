@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2002-2005 MontaVista Software, Inc.
- * Copyright (c) 2006-2013 Red Hat, Inc.
+ * Copyright (c) 2006-2020 Red Hat, Inc.
  *
  * All rights reserved.
  *
@@ -310,6 +310,10 @@ corosync_cfg_ring_status_get (
 		&res_lib_cfg_ringstatusget,
 		sizeof (struct res_lib_cfg_ringstatusget), CS_IPC_TIMEOUT_MS));
 
+	if (error != CS_OK) {
+		goto exit_handle_put;
+	}
+
 	*interface_count = res_lib_cfg_ringstatusget.interface_count;
 	*interface_names = malloc (sizeof (char *) * *interface_count);
 	if (*interface_names == NULL) {
@@ -339,7 +343,7 @@ corosync_cfg_ring_status_get (
 			goto error_free_status;
 		}
 	}
-	goto no_error;
+	goto exit_handle_put;
 
 error_free_status:
 	for (j = 0; j < i; j++) {
@@ -351,48 +355,165 @@ error_free_interface_names:
 	for (j = 0; j < i; j++) {
 		free ((*(interface_names))[j]);
 	}
-	
+
 	free (*status);
 
 error_free_interface_names_array:
 	free (*interface_names);
 
-no_error:
+exit_handle_put:
 	(void)hdb_handle_put (&cfg_hdb, cfg_handle);
 
 	return (error);
 }
 
 cs_error_t
-corosync_cfg_ring_reenable (
-	corosync_cfg_handle_t cfg_handle)
+corosync_cfg_node_status_get (
+	corosync_cfg_handle_t cfg_handle,
+	unsigned int nodeid,
+	corosync_cfg_node_status_version_t version,
+	void *node_status)
 {
 	struct cfg_inst *cfg_inst;
-	struct req_lib_cfg_ringreenable req_lib_cfg_ringreenable;
-	struct res_lib_cfg_ringreenable res_lib_cfg_ringreenable;
+	struct req_lib_cfg_nodestatusget req_lib_cfg_nodestatusget;
 	cs_error_t error;
 	struct iovec iov;
+	size_t cfg_node_status_size;
+	void *res_lib_cfg_nodestatuget_ptr;
+	struct res_lib_cfg_nodestatusget_v1 res_lib_cfg_nodestatusget_v1;
+	struct res_lib_cfg_nodestatusget_version *res_lib_cfg_nodestatusget_version;
+
+	if (!node_status) {
+		return (CS_ERR_INVALID_PARAM);
+	}
+
+	switch (version) {
+	case CFG_NODE_STATUS_V1:
+		cfg_node_status_size = sizeof(struct res_lib_cfg_nodestatusget_v1);
+		res_lib_cfg_nodestatuget_ptr = &res_lib_cfg_nodestatusget_v1;
+
+		break;
+	default:
+		return (CS_ERR_INVALID_PARAM);
+		break;
+	}
 
 	error = hdb_error_to_cs(hdb_handle_get (&cfg_hdb, cfg_handle, (void *)&cfg_inst));
 	if (error != CS_OK) {
 		return (error);
 	}
 
-	req_lib_cfg_ringreenable.header.size = sizeof (struct req_lib_cfg_ringreenable);
-	req_lib_cfg_ringreenable.header.id = MESSAGE_REQ_CFG_RINGREENABLE;
+	req_lib_cfg_nodestatusget.header.size = sizeof (struct req_lib_cfg_nodestatusget);
+	req_lib_cfg_nodestatusget.header.id = MESSAGE_REQ_CFG_NODESTATUSGET;
+	req_lib_cfg_nodestatusget.nodeid = nodeid;
+	req_lib_cfg_nodestatusget.version = version;
 
-	iov.iov_base = (void *)&req_lib_cfg_ringreenable,
-	iov.iov_len = sizeof (struct req_lib_cfg_ringreenable);
+	iov.iov_base = (void *)&req_lib_cfg_nodestatusget,
+	iov.iov_len = sizeof (struct req_lib_cfg_nodestatusget),
+
+	error = qb_to_cs_error (qb_ipcc_sendv_recv(cfg_inst->c,
+		&iov,
+		1,
+		res_lib_cfg_nodestatuget_ptr,
+		cfg_node_status_size, CS_IPC_TIMEOUT_MS));
+	if (error != CS_OK) {
+		goto error_put;
+	}
+
+	res_lib_cfg_nodestatusget_version = res_lib_cfg_nodestatuget_ptr;
+	error = res_lib_cfg_nodestatusget_version->header.error;
+	if (error != CS_OK) {
+		goto error_put;
+	}
+
+	if (res_lib_cfg_nodestatusget_version->version != version) {
+		/*
+		 * corosync sent us something we don't really understand.
+		 */
+		error = CS_ERR_NOT_SUPPORTED;
+		goto error_put;
+	}
+
+	switch (version) {
+	case CFG_NODE_STATUS_V1:
+		memcpy(node_status, &res_lib_cfg_nodestatusget_v1.node_status,
+		    sizeof(struct corosync_cfg_node_status_v1));
+		break;
+	}
+
+error_put:
+	(void)hdb_handle_put (&cfg_hdb, cfg_handle);
+
+	return (error);
+}
+
+
+cs_error_t
+corosync_cfg_trackstart (
+	corosync_cfg_handle_t cfg_handle,
+	uint8_t track_flags)
+{
+	struct cfg_inst *cfg_inst;
+	struct req_lib_cfg_trackstart req_lib_cfg_trackstart;
+	struct res_lib_cfg_trackstart res_lib_cfg_trackstart;
+	cs_error_t error;
+	struct iovec iov;
+
+	req_lib_cfg_trackstart.header.size = sizeof (struct req_lib_cfg_trackstart);
+	req_lib_cfg_trackstart.header.id = MESSAGE_REQ_CFG_TRACKSTART;
+	req_lib_cfg_trackstart.track_flags = track_flags;
+
+	error = hdb_error_to_cs(hdb_handle_get (&cfg_hdb, cfg_handle,
+		(void *)&cfg_inst));
+	if (error != CS_OK) {
+		return (error);
+	}
+
+	iov.iov_base = (void *)&req_lib_cfg_trackstart,
+	iov.iov_len = sizeof (struct req_lib_cfg_trackstart),
 
 	error = qb_to_cs_error (qb_ipcc_sendv_recv (cfg_inst->c,
 		&iov,
 		1,
-		&res_lib_cfg_ringreenable,
-		sizeof (struct res_lib_cfg_ringreenable), CS_IPC_TIMEOUT_MS));
+		&res_lib_cfg_trackstart,
+		sizeof (struct res_lib_cfg_trackstart), CS_IPC_TIMEOUT_MS));
 
 	(void)hdb_handle_put (&cfg_hdb, cfg_handle);
 
-	return (error);
+	return (error == CS_OK ? res_lib_cfg_trackstart.header.error : error);
+}
+
+cs_error_t
+corosync_cfg_trackstop (
+	corosync_cfg_handle_t cfg_handle)
+{
+	struct cfg_inst *cfg_inst;
+	struct req_lib_cfg_trackstop req_lib_cfg_trackstop;
+	struct res_lib_cfg_trackstop res_lib_cfg_trackstop;
+	cs_error_t error;
+	struct iovec iov;
+
+	error = hdb_error_to_cs (hdb_handle_get (&cfg_hdb, cfg_handle,
+		(void *)&cfg_inst));
+	if (error != CS_OK) {
+		return (error);
+	}
+
+	req_lib_cfg_trackstop.header.size = sizeof (struct req_lib_cfg_trackstop);
+	req_lib_cfg_trackstop.header.id = MESSAGE_REQ_CFG_TRACKSTOP;
+
+	iov.iov_base = (void *)&req_lib_cfg_trackstop,
+	iov.iov_len = sizeof (struct req_lib_cfg_trackstop),
+
+	error = qb_to_cs_error (qb_ipcc_sendv_recv (cfg_inst->c,
+		&iov,
+		1,
+		&res_lib_cfg_trackstop,
+		sizeof (struct res_lib_cfg_trackstop), CS_IPC_TIMEOUT_MS));
+
+	(void)hdb_handle_put (&cfg_hdb, cfg_handle);
+
+	return (error == CS_OK ? res_lib_cfg_trackstop.header.error : error);
 }
 
 cs_error_t
@@ -435,7 +556,7 @@ corosync_cfg_kill_node (
 
 	(void)hdb_handle_put (&cfg_hdb, cfg_handle);
 
-        return (error == CS_OK ? res_lib_cfg_killnode.header.error : error);
+	return (error == CS_OK ? res_lib_cfg_killnode.header.error : error);
 }
 
 cs_error_t
@@ -470,7 +591,7 @@ corosync_cfg_try_shutdown (
 
 	(void)hdb_handle_put (&cfg_hdb, cfg_handle);
 
-        return (error == CS_OK ? res_lib_cfg_tryshutdown.header.error : error);
+	return (error == CS_OK ? res_lib_cfg_tryshutdown.header.error : error);
 }
 
 cs_error_t
@@ -508,7 +629,7 @@ corosync_cfg_replyto_shutdown (
 
 cs_error_t corosync_cfg_get_node_addrs (
 	corosync_cfg_handle_t cfg_handle,
-	int nodeid,
+	unsigned int nodeid,
 	size_t max_addrs,
 	int *num_addrs,
 	corosync_cfg_node_address_t *addrs)
@@ -522,12 +643,14 @@ cs_error_t corosync_cfg_get_node_addrs (
 	struct iovec iov;
 	const char *addr_buf;
 	char response_buf[IPC_RESPONSE_SIZE];
+	char zeroes[sizeof(struct sockaddr_storage)];
 
 	error = hdb_error_to_cs(hdb_handle_get (&cfg_hdb, cfg_handle,
 		(void *)&cfg_inst));
 	if (error != CS_OK) {
 		return (error);
 	}
+	memset(zeroes, 0, sizeof(zeroes));
 
 	req_lib_cfg_get_node_addrs.header.size = sizeof (req_lib_cfg_get_node_addrs);
 	req_lib_cfg_get_node_addrs.header.id = MESSAGE_REQ_CFG_GET_NODE_ADDRS;
@@ -561,14 +684,26 @@ cs_error_t corosync_cfg_get_node_addrs (
 
 		if (res_lib_cfg_get_node_addrs->family == AF_INET) {
 			in = (struct sockaddr_in *)addrs[i].address;
-			in->sin_family = AF_INET;
+			if (memcmp(addr_buf, zeroes, addrlen) == 0) {
+				in->sin_family = 0;
+			} else {
+				in->sin_family = AF_INET;
+			}
 			memcpy(&in->sin_addr, addr_buf, sizeof(struct in_addr));
 		}
 		if (res_lib_cfg_get_node_addrs->family == AF_INET6) {
 			in6 = (struct sockaddr_in6 *)addrs[i].address;
-			in6->sin6_family = AF_INET6;
+
+			if (memcmp(addr_buf, zeroes, addrlen) == 0) {
+				in6->sin6_family = 0;
+			} else {
+				in6->sin6_family = AF_INET6;
+			}
 			memcpy(&in6->sin6_addr, addr_buf, sizeof(struct in6_addr));
 		}
+
+		/* Mark it as unused */
+
 	}
 	*num_addrs = res_lib_cfg_get_node_addrs->num_addrs;
 	errno = error = res_lib_cfg_get_node_addrs->header.error;
@@ -653,6 +788,45 @@ cs_error_t corosync_cfg_reload_config (
 	}
 
 	error = res_lib_cfg_reload_config.header.error;
+
+error_exit:
+	(void)hdb_handle_put (&cfg_hdb, handle);
+
+	return (error);
+}
+
+cs_error_t corosync_cfg_reopen_log_files (
+	corosync_cfg_handle_t handle)
+{
+	cs_error_t error;
+	struct cfg_inst *cfg_inst;
+	struct iovec iov;
+	struct req_lib_cfg_reopen_log_files req_lib_cfg_reopen_log_files;
+	struct res_lib_cfg_reopen_log_files res_lib_cfg_reopen_log_files;
+
+	error = hdb_error_to_cs(hdb_handle_get (&cfg_hdb, handle, (void *)&cfg_inst));
+	if (error != CS_OK) {
+		return (error);
+	}
+
+	req_lib_cfg_reopen_log_files.header.size = sizeof (struct qb_ipc_request_header);
+	req_lib_cfg_reopen_log_files.header.id = MESSAGE_REQ_CFG_REOPEN_LOG_FILES;
+
+	iov.iov_base = (void *)&req_lib_cfg_reopen_log_files;
+	iov.iov_len = sizeof (struct req_lib_cfg_reopen_log_files);
+
+	error = qb_to_cs_error (qb_ipcc_sendv_recv (
+		cfg_inst->c,
+		&iov,
+		1,
+		&res_lib_cfg_reopen_log_files,
+		sizeof (struct res_lib_cfg_reopen_log_files), CS_IPC_TIMEOUT_MS));
+
+	if (error != CS_OK) {
+		goto error_exit;
+	}
+
+	error = res_lib_cfg_reopen_log_files.header.error;
 
 error_exit:
 	(void)hdb_handle_put (&cfg_hdb, handle);

@@ -49,17 +49,22 @@ extern int totemudpu_initialize (
 	void **udpu_context,
 	struct totem_config *totem_config,
 	totemsrp_stats_t *stats,
-	int interface_no,
 	void *context,
 
 	void (*deliver_fn) (
 		void *context,
 		const void *msg,
-		unsigned int msg_len),
+		unsigned int msg_len,
+		const struct sockaddr_storage *system_from),
 
 	void (*iface_change_fn) (
 		void *context,
-		const struct totem_ip_address *iface_address),
+		const struct totem_ip_address *iface_address,
+		unsigned int ring_no),
+
+	void (*mtu_changed) (
+		void *context,
+		int net_mtu),
 
 	void (*target_set_completed) (
 		void *context));
@@ -87,9 +92,21 @@ extern int totemudpu_mcast_noflush_send (
 	const void *msg,
 	unsigned int msg_len);
 
+extern int totemudpu_nodestatus_get (void *net_context, unsigned int nodeid,
+				    struct totem_node_status *node_status);
+
+extern int totemudpu_ifaces_get (void *net_context,
+	char ***status,
+	unsigned int *iface_count);
+
 extern int totemudpu_recv_flush (void *udpu_context);
 
 extern int totemudpu_send_flush (void *udpu_context);
+
+extern int totemudpu_iface_set (void *net_context,
+	const struct totem_ip_address *local_addr,
+	unsigned short ip_port,
+	unsigned int iface_no);
 
 extern int totemudpu_iface_check (void *udpu_context);
 
@@ -97,15 +114,9 @@ extern int totemudpu_finalize (void *udpu_context);
 
 extern void totemudpu_net_mtu_adjust (void *udpu_context, struct totem_config *totem_config);
 
-extern const char *totemudpu_iface_print (void *udpu_context);
-
-extern int totemudpu_iface_get (
-	void *udpu_context,
-	struct totem_ip_address *addr);
-
 extern int totemudpu_token_target_set (
 	void *udpu_context,
-	const struct totem_ip_address *token_target);
+	unsigned int nodeid);
 
 extern int totemudpu_crypto_set (
 	void *udpu_context,
@@ -117,15 +128,17 @@ extern int totemudpu_recv_mcast_empty (
 
 extern int totemudpu_member_add (
 	void *udpu_context,
-	const struct totem_ip_address *member);
+	const struct totem_ip_address *local,
+	const struct totem_ip_address *member,
+	int ring_no);
 
 extern int totemudpu_member_remove (
 	void *udpu_context,
-	const struct totem_ip_address *member);
+	const struct totem_ip_address *member,
+	int ring_no);
 
-extern int totemudpu_member_set_active (
+extern int totemudpu_reconfigure (
 	void *udpu_context,
-	const struct totem_ip_address *member_ip,
-	int active);
+	struct totem_config *totem_config);
 
 #endif /* TOTEMUDPU_H_DEFINED */
